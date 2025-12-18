@@ -4,7 +4,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import datetime
 import re
-import altair as alt  # グラフ用ライブラリを追加
+import altair as alt
 
 # --- 定数設定 ---
 PENALTY_LIMIT_DAYS = 28
@@ -95,11 +95,9 @@ def get_history():
         sheet = client.open(SHEET_NAME).worksheet(HISTORY_SHEET_NAME)
         data = sheet.get_all_records()
         df = pd.DataFrame(data)
-        # カラム確保
         expected_cols = ['シリアルナンバー', '保有開始日', '補充日', '補充エリア', '確定報酬額', '備考']
         if df.empty: return pd.DataFrame(columns=expected_cols)
         
-        # 数値型変換
         df['確定報酬額'] = pd.to_numeric(df['確定報酬額'], errors='coerce').fillna(0).astype(int)
         df['補充日'] = pd.to_datetime(df['補充日']).dt.date
         return df
@@ -179,22 +177,120 @@ def replenish_data_bulk(serials, zone_name, base_price, current_week_count, toda
     return len(rows_to_delete), vol_bonus
 
 def add_manual_history(date_obj, amount, memo, category):
-    """手動で履歴を追加する"""
     client = get_connection()
     hist_sheet = client.open(SHEET_NAME).worksheet(HISTORY_SHEET_NAME)
     date_str = date_obj.strftime('%Y-%m-%d')
     row = [category, "-", date_str, "-", amount, memo]
     hist_sheet.append_row(row)
 
+# --- カード表示用HTML生成関数 ---
+def create_card_html(row, today):
+    p_days = PENALTY_LIMIT_DAYS - (today - row['保有開始日']).days
+    days_held = (today - row['保有開始日']).days
+    serial = row['シリアルナンバー']
+    last4 = serial[-4:] if len(serial) >= 4 else serial
+    start_date_str = row['保有開始日'].strftime('%m/%d')
+    
+    if p_days <= 5: priority = 1
+    elif days_held <= 3: priority = 2
+    else: priority = 3
+
+    if priority == 1:
+        border, text, status = "#e57373", "#c62828", f"要返却 (残{p_days}日)"
+    elif priority == 2:
+        border, text, status = "#81c784", "#2e7d32", "Bonus期間"
+    else:
+        border, text, status = "#e0e0e0", "#616161", f"通常 (残{p_days}日)"
+    
+    return f"""
+    <div style="background-color: white; border-radius: 8px; border-left: 6px solid {border}; 
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1); padding: 12px; margin-bottom: 12px;">
+        <div style="font-size: 11px; font-weight: bold; color: {text}; text-transform: uppercase; margin-bottom: 4px;">{status}</div>
+        <div style="font-size: 26px; font-weight: 800; color: #333; letter-spacing: 1px; line-height: 1.2;">{last4}</div>
+        <div style="display: flex; justify-content: space-between; align-items: end; margin-top: 4px;">
+            <div style="font-size: 10px; color: #999;">{serial}</div>
+            <div style="font-size: 12px; font-weight: 600; color: #555;">{start_date_str}〜</div>
+        </div>
+    </div>
+    """
+
 # --- メイン処理 ---
 def main():
     st.set_page_config(page_title="Battery Manager", page_icon="⚡", layout="wide")
     today = get_today_jst()
 
+    # セッション状態の初期化
     if 'parsed_data' not in st.session_state:
         st.session_state['parsed_data'] = None
+    if 'search_sn' not in st.session_state:
+        st.session_state['search_sn'] = "" # テンキー入力用の変数
 
+    # データ読み込み
+    df = get_data()
     hist_df = get_history()
+
+    # --- サイドバー：テンキー式検索 ---
+    st.sidebar.markdown("### 🔍 個別検索")
+    
+    # 1. 入力画面（キーボードが出ないようにMarkdown表示のみ）
+    display_sn = st.session_state['search_sn'] if st.session_state['search_sn'] else "----"
+    st.sidebar.markdown(f"""
+    <div style="background-color:#f0f2f6; padding:15px; border-radius:10px; text-align:center; font-size:24px; font-weight:bold; letter-spacing:2px; margin-bottom:10px; border:1px solid #ccc;">
+        {display_sn}
+    </div>
+    """, unsafe_allow_html=True)
+
+    # 2. テンキー作成
+    def on_click_num(n):
+        if len(st.session_state['search_sn']) < 8: # 8桁制限
+            st.session_state['search_sn'] += str(n)
+            
+    def on_click_clear():
+        st.session_state['search_sn'] = ""
+        
+    def on_click_bs():
+        st.session_state['search_sn'] = st.session_state['search_sn'][:-1]
+
+    # グリッド配置
+    c1, c2, c3 = st.sidebar.columns(3)
+    with c1:
+        st.button("7", on_click=on_click_num, args=(7,), use_container_width=True)
+        st.button("4", on_click=on_click_num, args=(4,), use_container_width=True)
+        st.button("1", on_click=on_click_num, args=(1,), use_container_width=True)
+        st.button("C", on_click=on_click_clear, use_container_width=True, type="primary") # クリア
+    with c2:
+        st.button("8", on_click=on_click_num, args=(8,), use_container_width=True)
+        st.button("5", on_click=on_click_num, args=(5,), use_container_width=True)
+        st.button("2", on_click=on_click_num, args=(2,), use_container_width=True)
+        st.button("0", on_click=on_click_num, args=(0,), use_container_width=True)
+    with c3:
+        st.button("9", on_click=on_click_num, args=(9,), use_container_width=True)
+        st.button("6", on_click=on_click_num, args=(6,), use_container_width=True)
+        st.button("3", on_click=on_click_num, args=(3,), use_container_width=True)
+        st.button("⌫", on_click=on_click_bs, use_container_width=True) # BackSpace
+
+    # 3. 検索ロジック (入力があるときだけ実行)
+    search_term = st.session_state['search_sn']
+    if search_term and not df.empty:
+        # 完全一致 または 後方一致で検索
+        hits = df[df['シリアルナンバー'].str.endswith(search_term)]
+        
+        st.sidebar.divider()
+        if not hits.empty:
+            st.sidebar.success(f"{len(hits)} 件ヒット")
+            for _, row in hits.iterrows():
+                st.sidebar.markdown(create_card_html(row, today), unsafe_allow_html=True)
+        else:
+            if len(search_term) >= 4: # 4桁以上打ってヒットしない場合のみ警告
+                st.sidebar.warning("在庫なし")
+                if not hist_df.empty:
+                    # 過去履歴にあるかチェック
+                    hist_hits = hist_df[hist_df['シリアルナンバー'].str.endswith(search_term)]
+                    if not hist_hits.empty:
+                        last_rec = hist_hits.iloc[0]
+                        st.sidebar.info(f"過去履歴: {last_rec['補充日']} に補充済")
+
+    # --- 集計処理 ---
     week_earnings = 0
     week_count = 0
     total_earnings = 0
@@ -202,15 +298,14 @@ def main():
     if not hist_df.empty:
         start_of_week = today - datetime.timedelta(days=today.weekday())
         weekly_df = hist_df[hist_df['補充日'] >= start_of_week]
-        
         real_jobs_df = weekly_df[~weekly_df['シリアルナンバー'].isin(["手動修正", "過去分", "調整"])]
         week_count = len(real_jobs_df)
-        
         week_earnings = weekly_df['確定報酬額'].sum()
         total_earnings = hist_df['確定報酬額'].sum()
 
     current_bonus = get_vol_bonus(week_count)
 
+    # --- メインコンテンツ ---
     tab_home, tab_inventory, tab_history = st.tabs(["ホーム", "在庫リスト", "収益レポート"])
 
     with tab_home:
@@ -303,18 +398,19 @@ def main():
 
         st.divider()
         st.subheader("ピックアップ推奨")
-        df = get_data()
         if not df.empty:
-            df['経過日数'] = df['保有開始日'].apply(lambda x: (today - x).days)
-            df['ペナルティ余命'] = PENALTY_LIMIT_DAYS - df['経過日数']
-            def calculate_priority(row):
-                if row['ペナルティ余命'] <= 5: return 1
-                elif row['経過日数'] <= 3: return 2
+            df_sorted = df.copy() 
+            df_sorted['days_held'] = df_sorted['保有開始日'].apply(lambda x: (today - x).days)
+            df_sorted['penalty_left'] = PENALTY_LIMIT_DAYS - df_sorted['days_held']
+            
+            def get_rank(r):
+                if r['penalty_left'] <= 5: return 1
+                elif r['days_held'] <= 3: return 2
                 return 3
-            df['優先ランク'] = df.apply(calculate_priority, axis=1)
-            df_sorted = df.sort_values(by=['優先ランク', '経過日数'], ascending=[True, False])
+            df_sorted['rank'] = df_sorted.apply(get_rank, axis=1)
+            df_sorted = df_sorted.sort_values(['rank', 'days_held'], ascending=[True, False])
+            
             top_n = df_sorted.head(STANDARD_RECOMMEND_NUM)
-
             if not top_n.empty:
                 st.caption("コピー用:")
                 st.code(" / ".join(top_n['シリアルナンバー'].tolist()), language="text")
@@ -322,25 +418,7 @@ def main():
                 for idx, (i, row) in enumerate(top_n.iterrows()):
                     col = cols[idx % 4]
                     with col:
-                        p_days = row['ペナルティ余命']
-                        serial = row['シリアルナンバー']
-                        last4 = serial[-4:] if len(serial) >= 4 else serial
-                        start_date_str = row['保有開始日'].strftime('%m/%d')
-                        if row['優先ランク'] == 1:
-                            border_color, text_color, status_text = "#e57373", "#c62828", f"要返却 (残{p_days}日)"
-                        elif row['優先ランク'] == 2:
-                            border_color, text_color, status_text = "#81c784", "#2e7d32", "Bonus期間"
-                        else:
-                            border_color, text_color, status_text = "#e0e0e0", "#616161", f"通常 (残{p_days}日)"
-                        st.markdown(f"""
-                        <div style="background-color: white; border-radius: 8px; border-left: 6px solid {border_color}; box-shadow: 0 2px 4px rgba(0,0,0,0.1); padding: 12px; margin-bottom: 12px;">
-                            <div style="font-size: 11px; font-weight: bold; color: {text_color}; text-transform: uppercase; margin-bottom: 4px;">{status_text}</div>
-                            <div style="font-size: 26px; font-weight: 800; color: #333; letter-spacing: 1px; line-height: 1.2;">{last4}</div>
-                            <div style="display: flex; justify-content: space-between; align-items: end; margin-top: 4px;">
-                                <div style="font-size: 10px; color: #999;">{serial}</div>
-                                <div style="font-size: 12px; font-weight: 600; color: #555;">{start_date_str}〜</div>
-                            </div>
-                        </div>""", unsafe_allow_html=True)
+                        st.markdown(create_card_html(row, today), unsafe_allow_html=True)
             else:
                 st.info("表示対象なし")
 
@@ -358,8 +436,16 @@ def main():
             st.divider()
 
             st.markdown("##### 全リスト")
-            df_disp = df_sorted.copy()
+            df_disp = df.copy()
+            df_disp['days_held'] = df_disp['保有開始日'].apply(lambda x: (today - x).days)
+            def get_rank_simple(r):
+                if (PENALTY_LIMIT_DAYS - r['days_held']) <= 5: return 1
+                elif r['days_held'] <= 3: return 2
+                return 3
+            df_disp['rank'] = df_disp.apply(get_rank_simple, axis=1)
+            df_disp = df_disp.sort_values(['rank', 'days_held'], ascending=[True, False])
             df_disp['保有開始日'] = df_disp['保有開始日'].apply(lambda x: x.strftime('%Y-%m-%d'))
+            df_disp = df_disp.rename(columns={'days_held': '経過日数'})
             st.dataframe(df_disp[['シリアルナンバー', '保有開始日', '経過日数']], use_container_width=True, hide_index=True)
         else:
             st.info("在庫はありません")
@@ -375,11 +461,9 @@ def main():
 
         if not hist_df.empty:
             st.markdown("#### 日別推移")
-            # グラフ用のデータ作成
             chart_df = hist_df.groupby('補充日')['確定報酬額'].sum().reset_index()
             chart_df.columns = ['日付', '金額']
             
-            # Altairチャート作成（ツールチップ付き、見やすいグラフ）
             chart = alt.Chart(chart_df).mark_bar(color='#29b6f6').encode(
                 x=alt.X('日付:T', axis=alt.Axis(format='%m/%d', title='日付', labelAngle=-45)),
                 y=alt.Y('金額:Q', axis=alt.Axis(title='金額(円)')),
@@ -388,7 +472,6 @@ def main():
                     alt.Tooltip('金額:Q', title='報酬', format=',')
                 ]
             ).interactive()
-            
             st.altair_chart(chart, use_container_width=True)
 
         st.divider()
