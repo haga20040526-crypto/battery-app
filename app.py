@@ -94,11 +94,9 @@ def get_history():
         sheet = client.open(SHEET_NAME).worksheet(HISTORY_SHEET_NAME)
         data = sheet.get_all_records()
         df = pd.DataFrame(data)
-        # カラム確保
         expected_cols = ['シリアルナンバー', '保有開始日', '補充日', '補充エリア', '確定報酬額', '備考']
         if df.empty: return pd.DataFrame(columns=expected_cols)
         
-        # 数値型変換
         df['確定報酬額'] = pd.to_numeric(df['確定報酬額'], errors='coerce').fillna(0).astype(int)
         df['補充日'] = pd.to_datetime(df['補充日']).dt.date
         return df
@@ -177,15 +175,11 @@ def replenish_data_bulk(serials, zone_name, base_price, current_week_count, toda
         
     return len(rows_to_delete), vol_bonus
 
-def add_manual_history(date_obj, amount, memo):
-    """手動で履歴を追加する（過去分、調整、訂正用）"""
+def add_manual_history(date_obj, amount, memo, category):
     client = get_connection()
     hist_sheet = client.open(SHEET_NAME).worksheet(HISTORY_SHEET_NAME)
-    
     date_str = date_obj.strftime('%Y-%m-%d')
-    # 手動登録用の行フォーマット
-    # シリアル, 保有開始, 補充日, エリア, 金額, 備考
-    row = ["手動/調整", "-", date_str, "-", amount, memo]
+    row = [category, "-", date_str, "-", amount, memo]
     hist_sheet.append_row(row)
 
 # --- メイン処理 ---
@@ -202,18 +196,11 @@ def main():
     total_earnings = 0
     
     if not hist_df.empty:
-        # 今週の計算
         start_of_week = today - datetime.timedelta(days=today.weekday())
         weekly_df = hist_df[hist_df['補充日'] >= start_of_week]
-        
-        # シリアルナンバーがあるものだけを本数としてカウント（調整金を除くため）
-        real_jobs_df = weekly_df[weekly_df['シリアルナンバー'] != "手動/調整"]
+        real_jobs_df = weekly_df[~weekly_df['シリアルナンバー'].isin(["手動修正", "過去分", "調整"])]
         week_count = len(real_jobs_df)
-        
-        # 金額は調整金も含めて合計
         week_earnings = weekly_df['確定報酬額'].sum()
-        
-        # 全期間合計
         total_earnings = hist_df['確定報酬額'].sum()
 
     current_bonus = get_vol_bonus(week_count)
@@ -236,15 +223,10 @@ def main():
         st.divider()
 
         st.subheader("ジョブ登録")
-        
-        job_mode = st.radio(
-            "作業モード",
-            ["取出 (在庫登録)", "補充 (報酬確定)"],
-            horizontal=True
-        )
+        job_mode = st.radio("作業モード", ["取出 (在庫登録)", "補充 (報酬確定)"], horizontal=True)
 
         if job_mode == "取出 (在庫登録)":
-            st.caption("「バッテリー管理」画面のリスト全体をコピー＆ペーストしてください")
+            st.caption("「バッテリー管理」画面のリスト全体をペースト")
             default_date = st.date_input("基準日 (読取不可時)", value=today)
             input_text = st.text_area("テキスト貼付", height=150, placeholder="ここにペースト...")
             
@@ -278,14 +260,13 @@ def main():
                         import time
                         time.sleep(2)
                         st.rerun()
-                
                 with col_cancel:
                     if st.button("キャンセル", use_container_width=True):
                         st.session_state['parsed_data'] = None
                         st.rerun()
 
         elif job_mode == "補充 (報酬確定)":
-            st.caption("補充したバッテリー番号のリストを貼り付けてください")
+            st.caption("補充したバッテリー番号リストをペースト")
             target_date = st.date_input("補充日", value=today)
             input_text = st.text_area("テキスト貼付", height=100, placeholder="ここにペースト...")
             
@@ -315,7 +296,6 @@ def main():
                             st.error("エラー: 在庫が見つかりません")
 
         st.divider()
-
         st.subheader("ピックアップ推奨")
         df = get_data()
         if not df.empty:
@@ -357,45 +337,77 @@ def main():
                         </div>""", unsafe_allow_html=True)
             else:
                 st.info("表示対象なし")
-        else:
-            st.info("データを読み込んでいます...")
 
     with tab_inventory:
-        st.subheader("在庫詳細")
+        st.subheader("📦 在庫詳細")
         if not df.empty:
+            # 1. 在庫総数の表示
+            st.metric("現在の在庫総数", f"{len(df)} 本")
+            st.divider()
+
+            # 2. 取得日別の集計表示
+            st.markdown("##### 📅 取得日別の本数")
+            date_counts = df['保有開始日'].value_counts().sort_index(ascending=False)
+            # 見やすいデータフレームに変換
+            date_summary = pd.DataFrame({'取得日': date_counts.index, '本数': date_counts.values})
+            # 日付フォーマット調整
+            date_summary['取得日'] = date_summary['取得日'].apply(lambda x: x.strftime('%Y-%m-%d'))
+            
+            # 横棒グラフで視覚的に表示しても良いが、今回はシンプルにテーブルで
+            st.dataframe(date_summary, hide_index=True, use_container_width=True)
+            st.divider()
+
+            st.markdown("##### 全リスト")
             df_disp = df_sorted.copy()
             df_disp['保有開始日'] = df_disp['保有開始日'].apply(lambda x: x.strftime('%Y-%m-%d'))
             st.dataframe(df_disp[['シリアルナンバー', '保有開始日', '経過日数']], use_container_width=True, hide_index=True)
+        else:
+            st.info("在庫はありません")
 
     with tab_history:
-        st.markdown("### 💰 収益レポート")
-        
-        # 累積収益の表示
-        st.metric("🏆 これまでの総収益 (積算)", f"¥ {total_earnings:,}")
+        st.markdown("### 📊 収益レポート")
+        col_main, col_sub = st.columns([3, 1])
+        with col_main:
+            st.metric("🔥 今週の確定報酬", f"¥ {week_earnings:,}")
+        with col_sub:
+            st.metric("積算 (全期間)", f"¥ {total_earnings:,}")
         st.divider()
 
-        # 手動調整フォーム
-        with st.expander("➕ 過去の稼働・修正・調整を追加する"):
-            st.caption("過去の稼働記録を追加したり、金額の訂正、後から承認されたエラー分の報酬などを登録できます。")
+        if not hist_df.empty:
+            st.markdown("#### 日別推移")
+            daily_sales = hist_df.groupby('補充日')['確定報酬額'].sum()
+            st.bar_chart(daily_sales)
+
+        st.divider()
+
+        with st.expander("🛠 訂正・過去分登録・調整"):
+            st.info("通常は自動計算されます。金額が合わない時の修正や、過去データを登録する時のみ使用してください。")
+            adjust_type = st.radio("種別", ["訂正・調整 (+/-)", "過去分 (初期登録)"], horizontal=True)
             with st.form("manual_history_form"):
                 col_d, col_a = st.columns([1, 1])
                 m_date = col_d.date_input("日付", value=today)
-                m_amount = col_a.number_input("金額 (円)", value=0, step=1, help="マイナスの値を入れると減額修正できます")
-                m_memo = st.text_input("内容 / 備考", placeholder="例: 12月第2週分, エラー調整分, 金額訂正など")
+                if adjust_type == "訂正・調整 (+/-)":
+                    m_amount = col_a.number_input("調整額 (円)", value=0, step=10, help="足りない場合はプラス、引きたい場合はマイナスを入力")
+                    m_memo = st.text_input("理由", placeholder="例: 70円計算だが実際は80円だったため+10円")
+                    category = "手動修正"
+                else:
+                    m_amount = col_a.number_input("売上額 (円)", value=0, step=100)
+                    m_memo = st.text_input("備考", placeholder="例: アプリ導入前の12月分合算")
+                    category = "過去分"
                 
                 submitted = st.form_submit_button("履歴に追加", type="primary")
                 if submitted:
                     if m_amount != 0:
-                        with st.spinner("追加中..."):
-                            add_manual_history(m_date, m_amount, m_memo)
-                        st.success(f"¥ {m_amount} を履歴に追加しました")
+                        with st.spinner("処理中..."):
+                            add_manual_history(m_date, m_amount, m_memo, category)
+                        st.success("履歴に追加しました")
                         import time
                         time.sleep(1)
                         st.rerun()
                     else:
                         st.error("金額を入力してください")
 
-        st.subheader("履歴一覧")
+        st.markdown("#### 履歴一覧")
         if not hist_df.empty:
             hist_disp = hist_df.sort_values('補充日', ascending=False).copy()
             hist_disp['補充日'] = hist_disp['補充日'].apply(lambda x: x.strftime('%Y-%m-%d'))
