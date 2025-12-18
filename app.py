@@ -4,6 +4,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import datetime
 import re
+import altair as alt  # グラフ用ライブラリを追加
 
 # --- 定数設定 ---
 PENALTY_LIMIT_DAYS = 28
@@ -94,9 +95,11 @@ def get_history():
         sheet = client.open(SHEET_NAME).worksheet(HISTORY_SHEET_NAME)
         data = sheet.get_all_records()
         df = pd.DataFrame(data)
+        # カラム確保
         expected_cols = ['シリアルナンバー', '保有開始日', '補充日', '補充エリア', '確定報酬額', '備考']
         if df.empty: return pd.DataFrame(columns=expected_cols)
         
+        # 数値型変換
         df['確定報酬額'] = pd.to_numeric(df['確定報酬額'], errors='coerce').fillna(0).astype(int)
         df['補充日'] = pd.to_datetime(df['補充日']).dt.date
         return df
@@ -176,6 +179,7 @@ def replenish_data_bulk(serials, zone_name, base_price, current_week_count, toda
     return len(rows_to_delete), vol_bonus
 
 def add_manual_history(date_obj, amount, memo, category):
+    """手動で履歴を追加する"""
     client = get_connection()
     hist_sheet = client.open(SHEET_NAME).worksheet(HISTORY_SHEET_NAME)
     date_str = date_obj.strftime('%Y-%m-%d')
@@ -198,8 +202,10 @@ def main():
     if not hist_df.empty:
         start_of_week = today - datetime.timedelta(days=today.weekday())
         weekly_df = hist_df[hist_df['補充日'] >= start_of_week]
+        
         real_jobs_df = weekly_df[~weekly_df['シリアルナンバー'].isin(["手動修正", "過去分", "調整"])]
         week_count = len(real_jobs_df)
+        
         week_earnings = weekly_df['確定報酬額'].sum()
         total_earnings = hist_df['確定報酬額'].sum()
 
@@ -341,19 +347,13 @@ def main():
     with tab_inventory:
         st.subheader("📦 在庫詳細")
         if not df.empty:
-            # 1. 在庫総数の表示
             st.metric("現在の在庫総数", f"{len(df)} 本")
             st.divider()
 
-            # 2. 取得日別の集計表示
             st.markdown("##### 📅 取得日別の本数")
             date_counts = df['保有開始日'].value_counts().sort_index(ascending=False)
-            # 見やすいデータフレームに変換
             date_summary = pd.DataFrame({'取得日': date_counts.index, '本数': date_counts.values})
-            # 日付フォーマット調整
             date_summary['取得日'] = date_summary['取得日'].apply(lambda x: x.strftime('%Y-%m-%d'))
-            
-            # 横棒グラフで視覚的に表示しても良いが、今回はシンプルにテーブルで
             st.dataframe(date_summary, hide_index=True, use_container_width=True)
             st.divider()
 
@@ -375,8 +375,21 @@ def main():
 
         if not hist_df.empty:
             st.markdown("#### 日別推移")
-            daily_sales = hist_df.groupby('補充日')['確定報酬額'].sum()
-            st.bar_chart(daily_sales)
+            # グラフ用のデータ作成
+            chart_df = hist_df.groupby('補充日')['確定報酬額'].sum().reset_index()
+            chart_df.columns = ['日付', '金額']
+            
+            # Altairチャート作成（ツールチップ付き、見やすいグラフ）
+            chart = alt.Chart(chart_df).mark_bar(color='#29b6f6').encode(
+                x=alt.X('日付:T', axis=alt.Axis(format='%m/%d', title='日付', labelAngle=-45)),
+                y=alt.Y('金額:Q', axis=alt.Axis(title='金額(円)')),
+                tooltip=[
+                    alt.Tooltip('日付:T', title='日付', format='%Y-%m-%d'), 
+                    alt.Tooltip('金額:Q', title='報酬', format=',')
+                ]
+            ).interactive()
+            
+            st.altair_chart(chart, use_container_width=True)
 
         st.divider()
 
