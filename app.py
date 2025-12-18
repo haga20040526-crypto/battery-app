@@ -217,6 +217,22 @@ def create_card_html(row, today):
 # --- メイン処理 ---
 def main():
     st.set_page_config(page_title="Battery Manager", page_icon="⚡", layout="wide")
+    
+    # ★モバイル用 CSSハック: 縦積み防止★
+    st.markdown("""
+        <style>
+        /* スマホでも列を横並びのままにする設定 */
+        div[data-testid="stHorizontalBlock"] {
+            flex-wrap: nowrap !important;
+            overflow-x: auto !important;
+        }
+        div[data-testid="column"] {
+            min-width: 0 !important;
+            flex: 1 1 auto !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
     today = get_today_jst()
 
     # セッション状態の初期化
@@ -244,15 +260,13 @@ def main():
 
     current_bonus = get_vol_bonus(week_count)
 
-    # --- タブ構成の変更 ---
-    # 検索タブを独立させました
+    # --- タブ構成 ---
     tab_home, tab_search, tab_inventory, tab_history = st.tabs(["🏠 ホーム", "🔍 個別検索", "📦 在庫", "💰 収益"])
 
     # ==========================
-    # 🏠 ホームタブ (ジョブ登録メイン)
+    # 🏠 ホームタブ
     # ==========================
     with tab_home:
-        # 今週の成果
         st.markdown("### 今週の成果")
         c1, c2, c3 = st.columns(3)
         c1.metric("報酬概算", f"¥ {week_earnings:,}")
@@ -347,7 +361,6 @@ def main():
             df_sorted = df.copy() 
             df_sorted['days_held'] = df_sorted['保有開始日'].apply(lambda x: (today - x).days)
             df_sorted['penalty_left'] = PENALTY_LIMIT_DAYS - df_sorted['days_held']
-            
             def get_rank(r):
                 if r['penalty_left'] <= 5: return 1
                 elif r['days_held'] <= 3: return 2
@@ -368,12 +381,12 @@ def main():
                 st.info("表示対象なし")
 
     # ==========================
-    # 🔍 個別検索タブ (テンキー)
+    # 🔍 個別検索タブ
     # ==========================
     with tab_search:
         st.markdown("### 🔢 個別バッテリー検索")
         
-        # 1. 入力画面
+        # 1. 入力表示
         display_sn = st.session_state['search_sn'] if st.session_state['search_sn'] else "----"
         st.markdown(f"""
         <div style="background-color:#f8f9fa; padding:20px; border-radius:12px; text-align:center; font-size:36px; font-weight:bold; letter-spacing:6px; margin-bottom:20px; border:2px solid #e0e0e0; color:#333;">
@@ -381,7 +394,7 @@ def main():
         </div>
         """, unsafe_allow_html=True)
 
-        # 2. テンキー作成
+        # 2. テンキー作成 (CSSハックで横並び強制)
         def on_click_num(n):
             if len(st.session_state['search_sn']) < 8:
                 st.session_state['search_sn'] += str(n)
@@ -390,13 +403,13 @@ def main():
         def on_click_bs():
             st.session_state['search_sn'] = st.session_state['search_sn'][:-1]
 
-        # 押しやすいグリッド配置 (テンキー)
+        # 横並びグリッド
         c1, c2, c3 = st.columns([1, 1, 1])
         with c1:
             st.button("7", on_click=on_click_num, args=(7,), use_container_width=True)
             st.button("4", on_click=on_click_num, args=(4,), use_container_width=True)
             st.button("1", on_click=on_click_num, args=(1,), use_container_width=True)
-            st.button("C", on_click=on_click_clear, use_container_width=True, type="primary") # クリア
+            st.button("C", on_click=on_click_clear, use_container_width=True, type="primary") 
         with c2:
             st.button("8", on_click=on_click_num, args=(8,), use_container_width=True)
             st.button("5", on_click=on_click_num, args=(5,), use_container_width=True)
