@@ -94,11 +94,15 @@ def get_history():
         sheet = client.open(SHEET_NAME).worksheet(HISTORY_SHEET_NAME)
         data = sheet.get_all_records()
         df = pd.DataFrame(data)
-        if df.empty: return pd.DataFrame(columns=['シリアルナンバー', '保有開始日', '補充日', '補充エリア', '確定報酬額'])
-        df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
+        # カラム確保
+        expected_cols = ['シリアルナンバー', '保有開始日', '補充日', '補充エリア', '確定報酬額', '備考']
+        if df.empty: return pd.DataFrame(columns=expected_cols)
+        
+        # 数値型変換
+        df['確定報酬額'] = pd.to_numeric(df['確定報酬額'], errors='coerce').fillna(0).astype(int)
         df['補充日'] = pd.to_datetime(df['補充日']).dt.date
         return df
-    except: return pd.DataFrame(columns=['シリアルナンバー', '保有開始日', '補充日', '補充エリア', '確定報酬額'])
+    except: return pd.DataFrame(columns=['シリアルナンバー', '保有開始日', '補充日', '補充エリア', '確定報酬額', '備考'])
 
 def get_vol_bonus(count):
     if count >= 150: return 20
@@ -118,14 +122,18 @@ def add_data_bulk_with_dates(data_list):
         existing_map = {}
 
     rows_to_add = []
+    skipped_count = 0
+    
     for s, d in data_list:
         if str(s) not in existing_map:
             rows_to_add.append([str(s), str(d)])
+        else:
+            skipped_count += 1
     
     if rows_to_add:
         sheet.append_rows(rows_to_add)
-        return len(rows_to_add)
-    return 0
+    
+    return len(rows_to_add), skipped_count
 
 def replenish_data_bulk(serials, zone_name, base_price, current_week_count, today_date):
     client = get_connection()
@@ -169,25 +177,47 @@ def replenish_data_bulk(serials, zone_name, base_price, current_week_count, toda
         
     return len(rows_to_delete), vol_bonus
 
+def add_manual_history(date_obj, amount, memo):
+    """手動で履歴を追加する（過去分、調整、訂正用）"""
+    client = get_connection()
+    hist_sheet = client.open(SHEET_NAME).worksheet(HISTORY_SHEET_NAME)
+    
+    date_str = date_obj.strftime('%Y-%m-%d')
+    # 手動登録用の行フォーマット
+    # シリアル, 保有開始, 補充日, エリア, 金額, 備考
+    row = ["手動/調整", "-", date_str, "-", amount, memo]
+    hist_sheet.append_row(row)
+
 # --- メイン処理 ---
 def main():
-    # ページ設定：アイコンもシンプルに
     st.set_page_config(page_title="Battery Manager", page_icon="⚡", layout="wide")
     today = get_today_jst()
+
+    if 'parsed_data' not in st.session_state:
+        st.session_state['parsed_data'] = None
 
     hist_df = get_history()
     week_earnings = 0
     week_count = 0
+    total_earnings = 0
     
     if not hist_df.empty:
+        # 今週の計算
         start_of_week = today - datetime.timedelta(days=today.weekday())
         weekly_df = hist_df[hist_df['補充日'] >= start_of_week]
-        week_earnings = weekly_df['確定報酬額'].sum() if not weekly_df.empty else 0
-        week_count = len(weekly_df)
+        
+        # シリアルナンバーがあるものだけを本数としてカウント（調整金を除くため）
+        real_jobs_df = weekly_df[weekly_df['シリアルナンバー'] != "手動/調整"]
+        week_count = len(real_jobs_df)
+        
+        # 金額は調整金も含めて合計
+        week_earnings = weekly_df['確定報酬額'].sum()
+        
+        # 全期間合計
+        total_earnings = hist_df['確定報酬額'].sum()
 
     current_bonus = get_vol_bonus(week_count)
 
-    # タブ：絵文字なし、シンプルに
     tab_home, tab_inventory, tab_history = st.tabs(["ホーム", "在庫リスト", "収益レポート"])
 
     with tab_home:
@@ -207,39 +237,53 @@ def main():
 
         st.subheader("ジョブ登録")
         
-        # モード選択：絵文字なし
         job_mode = st.radio(
             "作業モード",
             ["取出 (在庫登録)", "補充 (報酬確定)"],
             horizontal=True
         )
 
-        # --- 取出モード ---
         if job_mode == "取出 (在庫登録)":
             st.caption("「バッテリー管理」画面のリスト全体をコピー＆ペーストしてください")
             default_date = st.date_input("基準日 (読取不可時)", value=today)
             input_text = st.text_area("テキスト貼付", height=150, placeholder="ここにペースト...")
             
-            if input_text:
-                parsed_data = extract_serials_with_date(input_text, default_date)
-                if parsed_data:
-                    st.info(f"{len(parsed_data)} 件を検出しました")
-                    with st.expander("詳細確認"):
-                        st.write(parsed_data)
-                    
-                    # ボタンにMaterial Iconを使用
-                    if st.button("在庫に登録する", type="primary", use_container_width=True, icon=":material/save:"):
-                        with st.spinner('処理中...'):
-                            count = add_data_bulk_with_dates(parsed_data)
-                        if count > 0:
-                            st.success(f"{count} 件を登録しました")
+            if st.button("読込 (内容確認)", type="secondary", icon=":material/search:"):
+                if input_text:
+                    parsed = extract_serials_with_date(input_text, default_date)
+                    if parsed:
+                        st.session_state['parsed_data'] = parsed
+                        st.rerun()
+                    else:
+                        st.warning("シリアルナンバーが見つかりませんでした")
+
+            if st.session_state['parsed_data']:
+                st.divider()
+                st.markdown("##### 以下の内容で登録しますか？")
+                preview_df = pd.DataFrame(st.session_state['parsed_data'], columns=["シリアルナンバー", "取得日"])
+                st.dataframe(preview_df, hide_index=True, use_container_width=True)
+                
+                col_reg, col_cancel = st.columns([1, 1])
+                with col_reg:
+                    if st.button("登録を実行する", type="primary", use_container_width=True, icon=":material/save:"):
+                        with st.spinner('登録中...'):
+                            added, skipped = add_data_bulk_with_dates(st.session_state['parsed_data'])
+                        if added > 0:
+                            msg = f"✅ {added} 件を登録しました"
+                            if skipped > 0: msg += f" (重複スキップ: {skipped}件)"
+                            st.success(msg)
                         else:
-                            st.warning("検出された番号は既に存在します")
+                            st.warning(f"⚠️ 全て重複のためスキップされました (スキップ: {skipped}件)")
+                        st.session_state['parsed_data'] = None
                         import time
-                        time.sleep(1.5)
+                        time.sleep(2)
+                        st.rerun()
+                
+                with col_cancel:
+                    if st.button("キャンセル", use_container_width=True):
+                        st.session_state['parsed_data'] = None
                         st.rerun()
 
-        # --- 補充モード ---
         elif job_mode == "補充 (報酬確定)":
             st.caption("補充したバッテリー番号のリストを貼り付けてください")
             target_date = st.date_input("補充日", value=today)
@@ -249,16 +293,13 @@ def main():
                 extracted = extract_serials_only(input_text)
                 if extracted:
                     st.info(f"{len(extracted)} 件を検出しました")
-                    
                     col_zone, col_info = st.columns([2, 1])
                     with col_zone:
                         default_index = ZONE_OPTIONS.index("D: その他 (船橋など)")
                         selected_zone_name = st.selectbox("エリア選択", ZONE_OPTIONS, index=default_index)
-                    
                     base_price = ZONES[selected_zone_name]
                     est_bonus = get_vol_bonus(week_count + len(extracted))
                     est_total_price = base_price + est_bonus
-                    
                     with col_info:
                         st.metric("適用単価", f"¥{est_total_price}", f"基準{base_price}+ボ{est_bonus}")
 
@@ -275,19 +316,15 @@ def main():
 
         st.divider()
 
-        # --- 在庫カード表示（デザイン刷新） ---
         st.subheader("ピックアップ推奨")
-        
         df = get_data()
         if not df.empty:
             df['経過日数'] = df['保有開始日'].apply(lambda x: (today - x).days)
             df['ペナルティ余命'] = PENALTY_LIMIT_DAYS - df['経過日数']
-            
             def calculate_priority(row):
                 if row['ペナルティ余命'] <= 5: return 1
                 elif row['経過日数'] <= 3: return 2
                 return 3
-            
             df['優先ランク'] = df.apply(calculate_priority, axis=1)
             df_sorted = df.sort_values(by=['優先ランク', '経過日数'], ascending=[True, False])
             top_n = df_sorted.head(STANDARD_RECOMMEND_NUM)
@@ -295,7 +332,6 @@ def main():
             if not top_n.empty:
                 st.caption("コピー用:")
                 st.code(" / ".join(top_n['シリアルナンバー'].tolist()), language="text")
-
                 cols = st.columns(4)
                 for idx, (i, row) in enumerate(top_n.iterrows()):
                     col = cols[idx % 4]
@@ -304,49 +340,21 @@ def main():
                         serial = row['シリアルナンバー']
                         last4 = serial[-4:] if len(serial) >= 4 else serial
                         start_date_str = row['保有開始日'].strftime('%m/%d')
-                        
-                        # デザイン定義: シンプルな色分けとフラットデザイン
                         if row['優先ランク'] == 1:
-                            # 期限切れ間近 (赤)
-                            border_color = "#e57373"
-                            bg_color = "#ffebee"
-                            status_text = f"要返却 (残{p_days}日)"
-                            text_color = "#c62828"
+                            border_color, text_color, status_text = "#e57373", "#c62828", f"要返却 (残{p_days}日)"
                         elif row['優先ランク'] == 2:
-                            # ボーナス期間 (緑)
-                            border_color = "#81c784"
-                            bg_color = "#e8f5e9"
-                            status_text = "Bonus期間"
-                            text_color = "#2e7d32"
+                            border_color, text_color, status_text = "#81c784", "#2e7d32", "Bonus期間"
                         else:
-                            # 通常 (グレー)
-                            border_color = "#e0e0e0"
-                            bg_color = "#fafafa"
-                            status_text = f"通常 (残{p_days}日)"
-                            text_color = "#616161"
-                        
-                        # HTML/CSSでモダンなカードを作成
+                            border_color, text_color, status_text = "#e0e0e0", "#616161", f"通常 (残{p_days}日)"
                         st.markdown(f"""
-                        <div style="
-                            background-color: white;
-                            border-radius: 8px;
-                            border-left: 6px solid {border_color};
-                            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                            padding: 12px;
-                            margin-bottom: 12px;
-                        ">
-                            <div style="font-size: 11px; font-weight: bold; color: {text_color}; text-transform: uppercase; margin-bottom: 4px;">
-                                {status_text}
-                            </div>
-                            <div style="font-size: 26px; font-weight: 800; color: #333; letter-spacing: 1px; line-height: 1.2;">
-                                {last4}
-                            </div>
+                        <div style="background-color: white; border-radius: 8px; border-left: 6px solid {border_color}; box-shadow: 0 2px 4px rgba(0,0,0,0.1); padding: 12px; margin-bottom: 12px;">
+                            <div style="font-size: 11px; font-weight: bold; color: {text_color}; text-transform: uppercase; margin-bottom: 4px;">{status_text}</div>
+                            <div style="font-size: 26px; font-weight: 800; color: #333; letter-spacing: 1px; line-height: 1.2;">{last4}</div>
                             <div style="display: flex; justify-content: space-between; align-items: end; margin-top: 4px;">
                                 <div style="font-size: 10px; color: #999;">{serial}</div>
                                 <div style="font-size: 12px; font-weight: 600; color: #555;">{start_date_str}〜</div>
                             </div>
-                        </div>
-                        """, unsafe_allow_html=True)
+                        </div>""", unsafe_allow_html=True)
             else:
                 st.info("表示対象なし")
         else:
@@ -357,15 +365,37 @@ def main():
         if not df.empty:
             df_disp = df_sorted.copy()
             df_disp['保有開始日'] = df_disp['保有開始日'].apply(lambda x: x.strftime('%Y-%m-%d'))
-            # シンプルなテーブル表示
-            st.dataframe(
-                df_disp[['シリアルナンバー', '保有開始日', '経過日数']], 
-                use_container_width=True, 
-                hide_index=True
-            )
+            st.dataframe(df_disp[['シリアルナンバー', '保有開始日', '経過日数']], use_container_width=True, hide_index=True)
 
     with tab_history:
-        st.subheader("収益レポート")
+        st.markdown("### 💰 収益レポート")
+        
+        # 累積収益の表示
+        st.metric("🏆 これまでの総収益 (積算)", f"¥ {total_earnings:,}")
+        st.divider()
+
+        # 手動調整フォーム
+        with st.expander("➕ 過去の稼働・修正・調整を追加する"):
+            st.caption("過去の稼働記録を追加したり、金額の訂正、後から承認されたエラー分の報酬などを登録できます。")
+            with st.form("manual_history_form"):
+                col_d, col_a = st.columns([1, 1])
+                m_date = col_d.date_input("日付", value=today)
+                m_amount = col_a.number_input("金額 (円)", value=0, step=1, help="マイナスの値を入れると減額修正できます")
+                m_memo = st.text_input("内容 / 備考", placeholder="例: 12月第2週分, エラー調整分, 金額訂正など")
+                
+                submitted = st.form_submit_button("履歴に追加", type="primary")
+                if submitted:
+                    if m_amount != 0:
+                        with st.spinner("追加中..."):
+                            add_manual_history(m_date, m_amount, m_memo)
+                        st.success(f"¥ {m_amount} を履歴に追加しました")
+                        import time
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("金額を入力してください")
+
+        st.subheader("履歴一覧")
         if not hist_df.empty:
             hist_disp = hist_df.sort_values('補充日', ascending=False).copy()
             hist_disp['補充日'] = hist_disp['補充日'].apply(lambda x: x.strftime('%Y-%m-%d'))
