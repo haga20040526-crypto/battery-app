@@ -125,7 +125,7 @@ def replenish_data_bulk(serials, zone_name, base_price, current_week_count, time
             
             price = base_price + vol_bonus
             
-            # 早期ボーナス判定 (3日以内 = 72時間以内 と解釈もできるが、既存ロジックに合わせて日数で判定)
+            # 早期ボーナス判定 (3日以内)
             is_early = days_held <= 3
             if is_early: price += 10
             
@@ -165,4 +165,31 @@ def main():
     
     if not hist_df.empty:
         start_of_week = today - datetime.timedelta(days=today.weekday()) # 今週の月曜
-        start_of_week_dt = datetime.datetime.combine(start_of_week, datetime.time.min
+        # ★ここを修正しました（閉じカッコを追加）
+        start_of_week_dt = datetime.datetime.combine(start_of_week, datetime.time.min)
+        
+        # 日付フィルタ
+        weekly_df = hist_df[hist_df['補充日'] >= start_of_week_dt]
+        
+        week_earnings = weekly_df['確定報酬額'].sum() if not weekly_df.empty else 0
+        week_count = len(weekly_df)
+
+    current_bonus = get_vol_bonus(week_count)
+
+    # --- タブ構成 ---
+    tab_home, tab_inventory, tab_history = st.tabs(["🏠 ホーム", "📦 在庫管理", "💰 週間収益"])
+
+    # ==========================
+    # 🏠 ホームタブ
+    # ==========================
+    with tab_home:
+        # メトリクス表示
+        st.markdown("### 📊 今週の成果")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("報酬概算 (今週)", f"¥ {week_earnings:,}")
+        c2.metric("補充本数", f"{week_count} 本")
+        
+        if current_bonus < 20:
+            next_target = 20 if week_count < 20 else (50 if week_count < 50 else (100 if week_count < 100 else 150))
+            remain = next_target - week_count
+            c3.metric("現在ボーナス", f"+{current_bonus}円", delta=
