@@ -40,6 +40,11 @@ def get_connection():
     client = gspread.authorize(creds)
     return client
 
+# --- 日本時間取得用の関数 ---
+def get_jst_now():
+    # サーバー時間(UTC)に9時間を足してJSTにする
+    return datetime.datetime.now() + datetime.timedelta(hours=9)
+
 # --- データ取得 ---
 def get_data():
     client = get_connection()
@@ -80,11 +85,11 @@ def get_vol_bonus(count):
 def parse_datetime_input(text_input):
     """
     テキスト入力から日時を抽出する。
-    入力が空の場合は現在時刻を返す。
+    入力が空の場合は現在時刻(JST)を返す。
     フォーマット: YYYY-MM-DD HH:MM:SS
     """
     if not text_input:
-        return datetime.datetime.now()
+        return get_jst_now() # ここをJSTに変更
     
     # 正規表現で日時っぽい部分を探す
     match = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', text_input)
@@ -94,8 +99,8 @@ def parse_datetime_input(text_input):
         except ValueError:
             pass
     
-    # 解析失敗時は現在時刻 (あるいはエラーにしても良いが、使い勝手重視で現在時刻へ)
-    return datetime.datetime.now()
+    # 解析失敗時は現在時刻(JST)
+    return get_jst_now()
 
 # --- データ操作 ---
 def add_data_bulk(serials, timestamp_dt):
@@ -119,7 +124,6 @@ def replenish_data_bulk(serials, zone_name, base_price, current_week_count, time
     
     df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
     
-    # 補充後のランクでボーナス計算するか、現在ランクか。ここでは「今回の本数を含めたランク」で計算
     total_count_for_bonus = current_week_count + len(serials)
     vol_bonus = get_vol_bonus(total_count_for_bonus)
 
@@ -162,7 +166,8 @@ def extract_serials(text):
 def main():
     st.set_page_config(page_title="SpotJobs Manager", layout="wide")
     
-    now = datetime.datetime.now()
+    # ここをJSTに変更
+    now = get_jst_now()
     today = now.date()
 
     hist_df = get_history()
