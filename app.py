@@ -223,72 +223,11 @@ def main():
     if 'parsed_data' not in st.session_state:
         st.session_state['parsed_data'] = None
     if 'search_sn' not in st.session_state:
-        st.session_state['search_sn'] = "" # テンキー入力用の変数
+        st.session_state['search_sn'] = ""
 
     # データ読み込み
     df = get_data()
     hist_df = get_history()
-
-    # --- サイドバー：テンキー式検索 ---
-    st.sidebar.markdown("### 🔍 個別検索")
-    
-    # 1. 入力画面（キーボードが出ないようにMarkdown表示のみ）
-    display_sn = st.session_state['search_sn'] if st.session_state['search_sn'] else "----"
-    st.sidebar.markdown(f"""
-    <div style="background-color:#f0f2f6; padding:15px; border-radius:10px; text-align:center; font-size:24px; font-weight:bold; letter-spacing:2px; margin-bottom:10px; border:1px solid #ccc;">
-        {display_sn}
-    </div>
-    """, unsafe_allow_html=True)
-
-    # 2. テンキー作成
-    def on_click_num(n):
-        if len(st.session_state['search_sn']) < 8: # 8桁制限
-            st.session_state['search_sn'] += str(n)
-            
-    def on_click_clear():
-        st.session_state['search_sn'] = ""
-        
-    def on_click_bs():
-        st.session_state['search_sn'] = st.session_state['search_sn'][:-1]
-
-    # グリッド配置
-    c1, c2, c3 = st.sidebar.columns(3)
-    with c1:
-        st.button("7", on_click=on_click_num, args=(7,), use_container_width=True)
-        st.button("4", on_click=on_click_num, args=(4,), use_container_width=True)
-        st.button("1", on_click=on_click_num, args=(1,), use_container_width=True)
-        st.button("C", on_click=on_click_clear, use_container_width=True, type="primary") # クリア
-    with c2:
-        st.button("8", on_click=on_click_num, args=(8,), use_container_width=True)
-        st.button("5", on_click=on_click_num, args=(5,), use_container_width=True)
-        st.button("2", on_click=on_click_num, args=(2,), use_container_width=True)
-        st.button("0", on_click=on_click_num, args=(0,), use_container_width=True)
-    with c3:
-        st.button("9", on_click=on_click_num, args=(9,), use_container_width=True)
-        st.button("6", on_click=on_click_num, args=(6,), use_container_width=True)
-        st.button("3", on_click=on_click_num, args=(3,), use_container_width=True)
-        st.button("⌫", on_click=on_click_bs, use_container_width=True) # BackSpace
-
-    # 3. 検索ロジック (入力があるときだけ実行)
-    search_term = st.session_state['search_sn']
-    if search_term and not df.empty:
-        # 完全一致 または 後方一致で検索
-        hits = df[df['シリアルナンバー'].str.endswith(search_term)]
-        
-        st.sidebar.divider()
-        if not hits.empty:
-            st.sidebar.success(f"{len(hits)} 件ヒット")
-            for _, row in hits.iterrows():
-                st.sidebar.markdown(create_card_html(row, today), unsafe_allow_html=True)
-        else:
-            if len(search_term) >= 4: # 4桁以上打ってヒットしない場合のみ警告
-                st.sidebar.warning("在庫なし")
-                if not hist_df.empty:
-                    # 過去履歴にあるかチェック
-                    hist_hits = hist_df[hist_df['シリアルナンバー'].str.endswith(search_term)]
-                    if not hist_hits.empty:
-                        last_rec = hist_hits.iloc[0]
-                        st.sidebar.info(f"過去履歴: {last_rec['補充日']} に補充済")
 
     # --- 集計処理 ---
     week_earnings = 0
@@ -305,10 +244,15 @@ def main():
 
     current_bonus = get_vol_bonus(week_count)
 
-    # --- メインコンテンツ ---
-    tab_home, tab_inventory, tab_history = st.tabs(["ホーム", "在庫リスト", "収益レポート"])
+    # --- タブ構成の変更 ---
+    # 検索タブを独立させました
+    tab_home, tab_search, tab_inventory, tab_history = st.tabs(["🏠 ホーム", "🔍 個別検索", "📦 在庫", "💰 収益"])
 
+    # ==========================
+    # 🏠 ホームタブ (ジョブ登録メイン)
+    # ==========================
     with tab_home:
+        # 今週の成果
         st.markdown("### 今週の成果")
         c1, c2, c3 = st.columns(3)
         c1.metric("報酬概算", f"¥ {week_earnings:,}")
@@ -323,6 +267,7 @@ def main():
         
         st.divider()
 
+        # ジョブ登録
         st.subheader("ジョブ登録")
         job_mode = st.radio("作業モード", ["取出 (在庫登録)", "補充 (報酬確定)"], horizontal=True)
 
@@ -395,7 +340,7 @@ def main():
                             st.rerun()
                         else:
                             st.error("エラー: 在庫が見つかりません")
-
+        
         st.divider()
         st.subheader("ピックアップ推奨")
         if not df.empty:
@@ -422,6 +367,73 @@ def main():
             else:
                 st.info("表示対象なし")
 
+    # ==========================
+    # 🔍 個別検索タブ (テンキー)
+    # ==========================
+    with tab_search:
+        st.markdown("### 🔢 個別バッテリー検索")
+        
+        # 1. 入力画面
+        display_sn = st.session_state['search_sn'] if st.session_state['search_sn'] else "----"
+        st.markdown(f"""
+        <div style="background-color:#f8f9fa; padding:20px; border-radius:12px; text-align:center; font-size:36px; font-weight:bold; letter-spacing:6px; margin-bottom:20px; border:2px solid #e0e0e0; color:#333;">
+            {display_sn}
+        </div>
+        """, unsafe_allow_html=True)
+
+        # 2. テンキー作成
+        def on_click_num(n):
+            if len(st.session_state['search_sn']) < 8:
+                st.session_state['search_sn'] += str(n)
+        def on_click_clear():
+            st.session_state['search_sn'] = ""
+        def on_click_bs():
+            st.session_state['search_sn'] = st.session_state['search_sn'][:-1]
+
+        # 押しやすいグリッド配置 (テンキー)
+        c1, c2, c3 = st.columns([1, 1, 1])
+        with c1:
+            st.button("7", on_click=on_click_num, args=(7,), use_container_width=True)
+            st.button("4", on_click=on_click_num, args=(4,), use_container_width=True)
+            st.button("1", on_click=on_click_num, args=(1,), use_container_width=True)
+            st.button("C", on_click=on_click_clear, use_container_width=True, type="primary") # クリア
+        with c2:
+            st.button("8", on_click=on_click_num, args=(8,), use_container_width=True)
+            st.button("5", on_click=on_click_num, args=(5,), use_container_width=True)
+            st.button("2", on_click=on_click_num, args=(2,), use_container_width=True)
+            st.button("0", on_click=on_click_num, args=(0,), use_container_width=True)
+        with c3:
+            st.button("9", on_click=on_click_num, args=(9,), use_container_width=True)
+            st.button("6", on_click=on_click_num, args=(6,), use_container_width=True)
+            st.button("3", on_click=on_click_num, args=(3,), use_container_width=True)
+            st.button("⌫", on_click=on_click_bs, use_container_width=True)
+
+        # 3. 検索結果表示
+        st.divider()
+        search_term = st.session_state['search_sn']
+        
+        if search_term and not df.empty:
+            hits = df[df['シリアルナンバー'].str.endswith(search_term)]
+            
+            if not hits.empty:
+                st.success(f"{len(hits)} 件ヒット")
+                for _, row in hits.iterrows():
+                    st.markdown(create_card_html(row, today), unsafe_allow_html=True)
+            else:
+                if len(search_term) >= 4:
+                    st.warning("⚠️ 在庫なし")
+                    if not hist_df.empty:
+                        hist_hits = hist_df[hist_df['シリアルナンバー'].str.endswith(search_term)]
+                        if not hist_hits.empty:
+                            last_rec = hist_hits.iloc[0]
+                            s_date = last_rec['補充日'].strftime('%Y-%m-%d')
+                            st.info(f"💡 履歴あり: {s_date} に補充済み")
+        elif not search_term:
+            st.info("テンキーでシリアルナンバー（下4桁）を入力してください")
+
+    # ==========================
+    # 📦 在庫タブ
+    # ==========================
     with tab_inventory:
         st.subheader("📦 在庫詳細")
         if not df.empty:
@@ -450,6 +462,9 @@ def main():
         else:
             st.info("在庫はありません")
 
+    # ==========================
+    # 💰 収益タブ
+    # ==========================
     with tab_history:
         st.markdown("### 📊 収益レポート")
         col_main, col_sub = st.columns([3, 1])
