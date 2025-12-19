@@ -83,7 +83,9 @@ def get_data():
         if df.empty: return pd.DataFrame(columns=['シリアルナンバー', '保有開始日'])
         
         df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
-        df['保有開始日'] = pd.to_datetime(df['保有開始日']).dt.date
+        # 日付変換（エラー回避含む）
+        df['保有開始日'] = pd.to_datetime(df['保有開始日'], errors='coerce').dt.date
+        df = df.dropna(subset=['保有開始日']) # 日付がないデータは除外
         return df
     except: return pd.DataFrame(columns=['シリアルナンバー', '保有開始日'])
 
@@ -98,7 +100,7 @@ def get_history():
         if df.empty: return pd.DataFrame(columns=expected_cols)
         
         df['確定報酬額'] = pd.to_numeric(df['確定報酬額'], errors='coerce').fillna(0).astype(int)
-        df['補充日'] = pd.to_datetime(df['補充日']).dt.date
+        df['補充日'] = pd.to_datetime(df['補充日'], errors='coerce').dt.date
         return df
     except: return pd.DataFrame(columns=['シリアルナンバー', '保有開始日', '補充日', '補充エリア', '確定報酬額', '備考'])
 
@@ -217,18 +219,16 @@ def create_card_html(row, today):
 def main():
     st.set_page_config(page_title="Battery Manager", page_icon="⚡", layout="wide")
     
-    # CSS: スライダーの余白調整のみ残す (強制横並びは削除)
+    # CSS: スライダー調整
     st.markdown("""
         <style>
-        .stSlider {
-            padding-top: 1rem;
-        }
+        .stSlider { padding-top: 1rem; }
         </style>
     """, unsafe_allow_html=True)
     
     today = get_today_jst()
 
-    # セッション状態
+    # セッション
     if 'parsed_data' not in st.session_state:
         st.session_state['parsed_data'] = None
     if 'search_sn' not in st.session_state:
@@ -238,7 +238,7 @@ def main():
     df = get_data()
     hist_df = get_history()
 
-    # 集計処理
+    # 集計
     week_earnings = 0
     week_count = 0
     total_earnings = 0
@@ -253,12 +253,10 @@ def main():
 
     current_bonus = get_vol_bonus(week_count)
 
-    # --- タブ構成 ---
+    # --- タブ ---
     tab_home, tab_search, tab_inventory, tab_history = st.tabs(["🏠 ホーム", "🔍 個別検索", "📦 在庫", "💰 収益"])
 
-    # ==========================
-    # 🏠 ホームタブ
-    # ==========================
+    # 🏠 ホーム
     with tab_home:
         st.markdown("### 今週の成果")
         c1, c2, c3 = st.columns(3)
@@ -274,7 +272,6 @@ def main():
         
         st.divider()
 
-        # ジョブ登録
         st.subheader("ジョブ登録")
         job_mode = st.radio("作業モード", ["取出 (在庫登録)", "補充 (報酬確定)"], horizontal=True)
 
@@ -350,7 +347,7 @@ def main():
         
         st.divider()
         
-        # --- おすすめリスト (優先順 + 可変個数) ---
+        # --- おすすめリスト ---
         col_title, col_slider = st.columns([2, 1])
         with col_title:
             st.subheader("ピックアップ推奨")
@@ -362,49 +359,44 @@ def main():
             df_sorted['days_held'] = df_sorted['保有開始日'].apply(lambda x: (today - x).days)
             df_sorted['penalty_left'] = PENALTY_LIMIT_DAYS - df_sorted['days_held']
             
-            # 優先順位: 1.要返却(赤) -> 2.Bonus(緑) -> 3.通常(白)
-            # かつ、それぞれの中で「古い順(days_held大)」
+            # 優先度計算 (小さい数字ほど優先)
             def get_rank(r):
-                if r['penalty_left'] <= 5: return 1 
-                elif r['days_held'] <= 3: return 2
-                return 3
+                if r['penalty_left'] <= 5: return 1 # 要返却
+                elif r['days_held'] <= 3: return 2  # Bonus
+                return 3 # 通常
             
             df_sorted['rank'] = df_sorted.apply(get_rank, axis=1)
+            # ソート: ランク(1->2->3) > 日数(多い順＝古い順)
             df_sorted = df_sorted.sort_values(['rank', 'days_held'], ascending=[True, False])
             
             top_n = df_sorted.head(display_count)
             
             if not top_n.empty:
-                # コピー用一覧は削除済み
+                # ★修正ポイント: 行ごとにst.columnsを作り直すことで、
+                # スマホでもPCでも「左上→右」の順序を崩さずに表示する
                 
-                # カード表示 (標準機能によりスマホは縦1列、PCは横4列になる)
-                cols = st.columns(4)
-                for idx, (i, row) in enumerate(top_n.iterrows()):
-                    col = cols[idx % 4]
-                    with col:
-                        st.markdown(create_card_html(row, today), unsafe_allow_html=True)
+                # 4つずつ切り出して表示
+                for i in range(0, len(top_n), 4):
+                    chunk = top_n.iloc[i:i+4] # 4件分取得
+                    cols = st.columns(4)      # カラム作成
+                    for idx, (_, row) in enumerate(chunk.iterrows()):
+                        with cols[idx]:       # 順番に埋める
+                            st.markdown(create_card_html(row, today), unsafe_allow_html=True)
             else:
                 st.info("表示対象なし")
 
-    # ==========================
-    # 🔍 個別検索タブ
-    # ==========================
+    # 🔍 個別検索
     with tab_search:
         st.markdown("### 🔢 個別バッテリー検索")
-        
         search_num = st.number_input(
             "シリアルナンバー (下4桁)", 
-            min_value=0, 
-            value=0, 
-            step=1,
-            format="%d",
+            min_value=0, value=0, step=1, format="%d",
             help="タップするとスマホのテンキーが開きます"
         )
         
         if search_num > 0 and not df.empty:
             search_term = str(int(search_num)) 
             hits = df[df['シリアルナンバー'].str.endswith(search_term)]
-            
             st.divider()
             if not hits.empty:
                 st.success(f"{len(hits)} 件ヒット")
@@ -422,9 +414,7 @@ def main():
         else:
             st.info("👆 ボックスをタップして番号を入力してください")
 
-    # ==========================
-    # 📦 在庫タブ
-    # ==========================
+    # 📦 在庫
     with tab_inventory:
         st.subheader("📦 在庫詳細")
         if not df.empty:
@@ -453,9 +443,7 @@ def main():
         else:
             st.info("在庫はありません")
 
-    # ==========================
-    # 💰 収益タブ
-    # ==========================
+    # 💰 収益
     with tab_history:
         st.markdown("### 📊 収益レポート")
         col_main, col_sub = st.columns([3, 1])
