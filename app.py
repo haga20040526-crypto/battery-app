@@ -83,9 +83,8 @@ def get_data():
         if df.empty: return pd.DataFrame(columns=['シリアルナンバー', '保有開始日'])
         
         df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
-        # 日付変換（エラー回避含む）
         df['保有開始日'] = pd.to_datetime(df['保有開始日'], errors='coerce').dt.date
-        df = df.dropna(subset=['保有開始日']) # 日付がないデータは除外
+        df = df.dropna(subset=['保有開始日']) 
         return df
     except: return pd.DataFrame(columns=['シリアルナンバー', '保有開始日'])
 
@@ -317,22 +316,27 @@ def main():
 
         elif job_mode == "補充 (報酬確定)":
             st.caption("補充したバッテリー番号リストをペースト")
-            target_date = st.date_input("補充日", value=today)
+            
+            # --- 修正点: エリア選択をここに移動（常時表示） ---
+            col_date, col_area = st.columns([1, 1])
+            with col_date:
+                target_date = st.date_input("補充日", value=today)
+            with col_area:
+                default_index = ZONE_OPTIONS.index("D: その他 (船橋など)")
+                selected_zone_name = st.selectbox("エリア選択", ZONE_OPTIONS, index=default_index)
+
             input_text = st.text_area("テキスト貼付", height=100, placeholder="ここにペースト...")
             
             if input_text:
                 extracted = extract_serials_only(input_text)
                 if extracted:
                     st.info(f"{len(extracted)} 件を検出しました")
-                    col_zone, col_info = st.columns([2, 1])
-                    with col_zone:
-                        default_index = ZONE_OPTIONS.index("D: その他 (船橋など)")
-                        selected_zone_name = st.selectbox("エリア選択", ZONE_OPTIONS, index=default_index)
+                    
                     base_price = ZONES[selected_zone_name]
                     est_bonus = get_vol_bonus(week_count + len(extracted))
                     est_total_price = base_price + est_bonus
-                    with col_info:
-                        st.metric("適用単価", f"¥{est_total_price}", f"基準{base_price}+ボ{est_bonus}")
+                    
+                    st.metric("適用単価", f"¥{est_total_price}", f"基準{base_price}+ボ{est_bonus}")
 
                     if st.button("補充を確定する", type="primary", use_container_width=True, icon=":material/check_circle:"):
                         with st.spinner('処理中...'):
@@ -359,28 +363,23 @@ def main():
             df_sorted['days_held'] = df_sorted['保有開始日'].apply(lambda x: (today - x).days)
             df_sorted['penalty_left'] = PENALTY_LIMIT_DAYS - df_sorted['days_held']
             
-            # 優先度計算 (小さい数字ほど優先)
             def get_rank(r):
                 if r['penalty_left'] <= 5: return 1 # 要返却
                 elif r['days_held'] <= 3: return 2  # Bonus
                 return 3 # 通常
             
             df_sorted['rank'] = df_sorted.apply(get_rank, axis=1)
-            # ソート: ランク(1->2->3) > 日数(多い順＝古い順)
             df_sorted = df_sorted.sort_values(['rank', 'days_held'], ascending=[True, False])
             
             top_n = df_sorted.head(display_count)
             
             if not top_n.empty:
-                # ★修正ポイント: 行ごとにst.columnsを作り直すことで、
-                # スマホでもPCでも「左上→右」の順序を崩さずに表示する
-                
-                # 4つずつ切り出して表示
+                # 4つずつ表示（スマホ対応）
                 for i in range(0, len(top_n), 4):
-                    chunk = top_n.iloc[i:i+4] # 4件分取得
-                    cols = st.columns(4)      # カラム作成
+                    chunk = top_n.iloc[i:i+4]
+                    cols = st.columns(4)
                     for idx, (_, row) in enumerate(chunk.iterrows()):
-                        with cols[idx]:       # 順番に埋める
+                        with cols[idx]:
                             st.markdown(create_card_html(row, today), unsafe_allow_html=True)
             else:
                 st.info("表示対象なし")
