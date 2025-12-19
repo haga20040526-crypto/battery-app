@@ -183,7 +183,7 @@ def add_manual_history(date_obj, amount, memo, category):
     row = [category, "-", date_str, "-", amount, memo]
     hist_sheet.append_row(row)
 
-# --- カード表示用HTML生成関数 ---
+# --- ★修正版: カード表示用HTML生成関数 ---
 def create_card_html(row, today):
     p_days = PENALTY_LIMIT_DAYS - (today - row['保有開始日']).days
     days_held = (today - row['保有開始日']).days
@@ -191,25 +191,47 @@ def create_card_html(row, today):
     last4 = serial[-4:] if len(serial) >= 4 else serial
     start_date_str = row['保有開始日'].strftime('%m/%d')
     
+    # 優先度計算
     if p_days <= 5: priority = 1
     elif days_held <= 3: priority = 2
     else: priority = 3
 
     if priority == 1:
-        border, text, status = "#e57373", "#c62828", f"要返却 (残{p_days}日)"
+        # 赤 (要返却)
+        border, text_c, status = "#e57373", "#c62828", f"🔥 要返却 (残{p_days}日)"
+        bg_c = "#fff5f5"
     elif priority == 2:
-        border, text, status = "#81c784", "#2e7d32", "Bonus期間"
+        # 緑 (Bonus)
+        border, text_c, status = "#81c784", "#2e7d32", "💎 Bonus期間"
+        bg_c = "#f1f8e9"
     else:
-        border, text, status = "#e0e0e0", "#616161", f"通常 (残{p_days}日)"
+        # 通常
+        border, text_c, status = "#bdbdbd", "#616161", f"🐢 通常 (残{p_days}日)"
+        bg_c = "#ffffff"
     
+    # デザイン刷新: 日付をメインに、SNを小さく
     return f"""
-    <div style="background-color: white; border-radius: 8px; border-left: 6px solid {border}; 
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1); padding: 12px; margin-bottom: 12px;">
-        <div style="font-size: 11px; font-weight: bold; color: {text}; text-transform: uppercase; margin-bottom: 4px;">{status}</div>
-        <div style="font-size: 26px; font-weight: 800; color: #333; letter-spacing: 1px; line-height: 1.2;">{last4}</div>
-        <div style="display: flex; justify-content: space-between; align-items: end; margin-top: 4px;">
-            <div style="font-size: 10px; color: #999;">{serial}</div>
-            <div style="font-size: 12px; font-weight: 600; color: #555;">{start_date_str}〜</div>
+    <div style="
+        background-color: {bg_c}; 
+        border-radius: 8px; 
+        border-left: 8px solid {border}; 
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1); 
+        padding: 12px; 
+        margin-bottom: 12px;
+    ">
+        <div style="font-size: 12px; font-weight: bold; color: {text_c}; margin-bottom: 4px;">
+            {status}
+        </div>
+        <div style="display: flex; align-items: baseline; justify-content: space-between;">
+            <div style="font-size: 36px; font-weight: 900; color: #212121; line-height: 1;">
+                {start_date_str}
+            </div>
+            <div style="font-size: 16px; font-weight: bold; color: #555;">
+                {days_held}日目
+            </div>
+        </div>
+        <div style="text-align: right; font-size: 11px; color: #999; margin-top: 6px; font-family: monospace;">
+            SN: {serial}
         </div>
     </div>
     """
@@ -317,7 +339,6 @@ def main():
         elif job_mode == "補充 (報酬確定)":
             st.caption("補充したバッテリー番号リストをペースト")
             
-            # --- 修正点: エリア選択をここに移動（常時表示） ---
             col_date, col_area = st.columns([1, 1])
             with col_date:
                 target_date = st.date_input("補充日", value=today)
@@ -369,6 +390,7 @@ def main():
                 return 3 # 通常
             
             df_sorted['rank'] = df_sorted.apply(get_rank, axis=1)
+            # ソート: ランク(1->2->3) > 日数(多い順＝古い順)
             df_sorted = df_sorted.sort_values(['rank', 'days_held'], ascending=[True, False])
             
             top_n = df_sorted.head(display_count)
