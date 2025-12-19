@@ -10,7 +10,6 @@ import altair as alt
 PENALTY_LIMIT_DAYS = 28
 SHEET_NAME = 'battery_db' 
 HISTORY_SHEET_NAME = 'history'
-STANDARD_RECOMMEND_NUM = 7
 
 # --- エリア定義 ---
 ZONE_OPTIONS = [
@@ -217,11 +216,31 @@ def create_card_html(row, today):
 # --- メイン処理 ---
 def main():
     st.set_page_config(page_title="Battery Manager", page_icon="⚡", layout="wide")
+    
+    # CSS設定（スマホ横並び維持 & スライダー調整）
+    st.markdown("""
+        <style>
+        [data-testid="column"] {
+            min-width: 0 !important;
+            flex: 1 !important;
+        }
+        [data-testid="stHorizontalBlock"] {
+            flex-wrap: nowrap !important;
+        }
+        /* スライダーの余白調整 */
+        .stSlider {
+            padding-top: 1rem;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
     today = get_today_jst()
 
     # セッション状態
     if 'parsed_data' not in st.session_state:
         st.session_state['parsed_data'] = None
+    if 'search_sn' not in st.session_state:
+        st.session_state['search_sn'] = ""
 
     # データ読み込み
     df = get_data()
@@ -263,6 +282,7 @@ def main():
         
         st.divider()
 
+        # ジョブ登録
         st.subheader("ジョブ登録")
         job_mode = st.radio("作業モード", ["取出 (在庫登録)", "補充 (報酬確定)"], horizontal=True)
 
@@ -337,22 +357,42 @@ def main():
                             st.error("エラー: 在庫が見つかりません")
         
         st.divider()
-        st.subheader("ピックアップ推奨")
+        
+        # --- おすすめリスト (優先順 + 可変個数) ---
+        col_title, col_slider = st.columns([2, 1])
+        with col_title:
+            st.subheader("ピックアップ推奨")
+        with col_slider:
+            # 個数変更スライダー (1-20個, デフォルト7)
+            display_count = st.slider("表示数", 1, 20, 7)
+
         if not df.empty:
             df_sorted = df.copy() 
             df_sorted['days_held'] = df_sorted['保有開始日'].apply(lambda x: (today - x).days)
             df_sorted['penalty_left'] = PENALTY_LIMIT_DAYS - df_sorted['days_held']
+            
+            # 優先順位ロジック
+            # 1. 要返却 (赤): 残り日数少ない順 (days_heldが大きい順)
+            # 2. Bonus (緑): ボーナス終了近い順 (days_heldが大きい順)
+            # 3. 通常 (白): 古い順 (days_heldが大きい順)
+            # -> 共通して「days_held が大きい(古い)もの」ほど優先度が高い
             def get_rank(r):
-                if r['penalty_left'] <= 5: return 1
-                elif r['days_held'] <= 3: return 2
-                return 3
+                if r['penalty_left'] <= 5: return 1 # 最優先
+                elif r['days_held'] <= 3: return 2 # 次点
+                return 3 # 通常
+            
             df_sorted['rank'] = df_sorted.apply(get_rank, axis=1)
+            # rank昇順(1->2->3), days_held降順(古い順)
             df_sorted = df_sorted.sort_values(['rank', 'days_held'], ascending=[True, False])
             
-            top_n = df_sorted.head(STANDARD_RECOMMEND_NUM)
+            # スライダーの数だけ切り出し
+            top_n = df_sorted.head(display_count)
+            
             if not top_n.empty:
-                st.caption("コピー用:")
+                st.caption(f"優先度の高い順に {len(top_n)} 件を表示:")
                 st.code(" / ".join(top_n['シリアルナンバー'].tolist()), language="text")
+                
+                # カード表示 (4列カラム)
                 cols = st.columns(4)
                 for idx, (i, row) in enumerate(top_n.iterrows()):
                     col = cols[idx % 4]
@@ -362,13 +402,11 @@ def main():
                 st.info("表示対象なし")
 
     # ==========================
-    # 🔍 個別検索タブ (スマホテンキー起動版)
+    # 🔍 個別検索タブ
     # ==========================
     with tab_search:
         st.markdown("### 🔢 個別バッテリー検索")
         
-        # 画面上のボタンをやめ、ネイティブの数値入力を採用
-        # st.number_inputを使うと、スマホではテンキー(数字パッド)が開きます
         search_num = st.number_input(
             "シリアルナンバー (下4桁)", 
             min_value=0, 
@@ -378,10 +416,8 @@ def main():
             help="タップするとスマホのテンキーが開きます"
         )
         
-        # 0の場合は未入力扱いにする
         if search_num > 0 and not df.empty:
-            search_term = str(int(search_num)) # 文字列に変換
-            
+            search_term = str(int(search_num)) 
             hits = df[df['シリアルナンバー'].str.endswith(search_term)]
             
             st.divider()
