@@ -217,35 +217,17 @@ def create_card_html(row, today):
 # --- メイン処理 ---
 def main():
     st.set_page_config(page_title="Battery Manager", page_icon="⚡", layout="wide")
-    
-    # ★モバイル用 CSSハック: 縦積み防止★
-    st.markdown("""
-        <style>
-        /* スマホでも列を横並びのままにする設定 */
-        div[data-testid="stHorizontalBlock"] {
-            flex-wrap: nowrap !important;
-            overflow-x: auto !important;
-        }
-        div[data-testid="column"] {
-            min-width: 0 !important;
-            flex: 1 1 auto !important;
-        }
-        </style>
-    """, unsafe_allow_html=True)
-    
     today = get_today_jst()
 
-    # セッション状態の初期化
+    # セッション状態
     if 'parsed_data' not in st.session_state:
         st.session_state['parsed_data'] = None
-    if 'search_sn' not in st.session_state:
-        st.session_state['search_sn'] = ""
 
     # データ読み込み
     df = get_data()
     hist_df = get_history()
 
-    # --- 集計処理 ---
+    # 集計処理
     week_earnings = 0
     week_count = 0
     total_earnings = 0
@@ -281,7 +263,6 @@ def main():
         
         st.divider()
 
-        # ジョブ登録
         st.subheader("ジョブ登録")
         job_mode = st.radio("作業モード", ["取出 (在庫登録)", "補充 (報酬確定)"], horizontal=True)
 
@@ -381,53 +362,29 @@ def main():
                 st.info("表示対象なし")
 
     # ==========================
-    # 🔍 個別検索タブ
+    # 🔍 個別検索タブ (スマホテンキー起動版)
     # ==========================
     with tab_search:
         st.markdown("### 🔢 個別バッテリー検索")
         
-        # 1. 入力表示
-        display_sn = st.session_state['search_sn'] if st.session_state['search_sn'] else "----"
-        st.markdown(f"""
-        <div style="background-color:#f8f9fa; padding:20px; border-radius:12px; text-align:center; font-size:36px; font-weight:bold; letter-spacing:6px; margin-bottom:20px; border:2px solid #e0e0e0; color:#333;">
-            {display_sn}
-        </div>
-        """, unsafe_allow_html=True)
-
-        # 2. テンキー作成 (CSSハックで横並び強制)
-        def on_click_num(n):
-            if len(st.session_state['search_sn']) < 8:
-                st.session_state['search_sn'] += str(n)
-        def on_click_clear():
-            st.session_state['search_sn'] = ""
-        def on_click_bs():
-            st.session_state['search_sn'] = st.session_state['search_sn'][:-1]
-
-        # 横並びグリッド
-        c1, c2, c3 = st.columns([1, 1, 1])
-        with c1:
-            st.button("7", on_click=on_click_num, args=(7,), use_container_width=True)
-            st.button("4", on_click=on_click_num, args=(4,), use_container_width=True)
-            st.button("1", on_click=on_click_num, args=(1,), use_container_width=True)
-            st.button("C", on_click=on_click_clear, use_container_width=True, type="primary") 
-        with c2:
-            st.button("8", on_click=on_click_num, args=(8,), use_container_width=True)
-            st.button("5", on_click=on_click_num, args=(5,), use_container_width=True)
-            st.button("2", on_click=on_click_num, args=(2,), use_container_width=True)
-            st.button("0", on_click=on_click_num, args=(0,), use_container_width=True)
-        with c3:
-            st.button("9", on_click=on_click_num, args=(9,), use_container_width=True)
-            st.button("6", on_click=on_click_num, args=(6,), use_container_width=True)
-            st.button("3", on_click=on_click_num, args=(3,), use_container_width=True)
-            st.button("⌫", on_click=on_click_bs, use_container_width=True)
-
-        # 3. 検索結果表示
-        st.divider()
-        search_term = st.session_state['search_sn']
+        # 画面上のボタンをやめ、ネイティブの数値入力を採用
+        # st.number_inputを使うと、スマホではテンキー(数字パッド)が開きます
+        search_num = st.number_input(
+            "シリアルナンバー (下4桁)", 
+            min_value=0, 
+            value=0, 
+            step=1,
+            format="%d",
+            help="タップするとスマホのテンキーが開きます"
+        )
         
-        if search_term and not df.empty:
+        # 0の場合は未入力扱いにする
+        if search_num > 0 and not df.empty:
+            search_term = str(int(search_num)) # 文字列に変換
+            
             hits = df[df['シリアルナンバー'].str.endswith(search_term)]
             
+            st.divider()
             if not hits.empty:
                 st.success(f"{len(hits)} 件ヒット")
                 for _, row in hits.iterrows():
@@ -441,8 +398,8 @@ def main():
                             last_rec = hist_hits.iloc[0]
                             s_date = last_rec['補充日'].strftime('%Y-%m-%d')
                             st.info(f"💡 履歴あり: {s_date} に補充済み")
-        elif not search_term:
-            st.info("テンキーでシリアルナンバー（下4桁）を入力してください")
+        else:
+            st.info("👆 ボックスをタップして番号を入力してください")
 
     # ==========================
     # 📦 在庫タブ
