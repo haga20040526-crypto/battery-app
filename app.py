@@ -217,17 +217,9 @@ def create_card_html(row, today):
 def main():
     st.set_page_config(page_title="Battery Manager", page_icon="⚡", layout="wide")
     
-    # CSS設定（スマホ横並び維持 & スライダー調整）
+    # CSS: スライダーの余白調整のみ残す (強制横並びは削除)
     st.markdown("""
         <style>
-        [data-testid="column"] {
-            min-width: 0 !important;
-            flex: 1 !important;
-        }
-        [data-testid="stHorizontalBlock"] {
-            flex-wrap: nowrap !important;
-        }
-        /* スライダーの余白調整 */
         .stSlider {
             padding-top: 1rem;
         }
@@ -363,7 +355,6 @@ def main():
         with col_title:
             st.subheader("ピックアップ推奨")
         with col_slider:
-            # 個数変更スライダー (1-20個, デフォルト7)
             display_count = st.slider("表示数", 1, 20, 7)
 
         if not df.empty:
@@ -371,28 +362,22 @@ def main():
             df_sorted['days_held'] = df_sorted['保有開始日'].apply(lambda x: (today - x).days)
             df_sorted['penalty_left'] = PENALTY_LIMIT_DAYS - df_sorted['days_held']
             
-            # 優先順位ロジック
-            # 1. 要返却 (赤): 残り日数少ない順 (days_heldが大きい順)
-            # 2. Bonus (緑): ボーナス終了近い順 (days_heldが大きい順)
-            # 3. 通常 (白): 古い順 (days_heldが大きい順)
-            # -> 共通して「days_held が大きい(古い)もの」ほど優先度が高い
+            # 優先順位: 1.要返却(赤) -> 2.Bonus(緑) -> 3.通常(白)
+            # かつ、それぞれの中で「古い順(days_held大)」
             def get_rank(r):
-                if r['penalty_left'] <= 5: return 1 # 最優先
-                elif r['days_held'] <= 3: return 2 # 次点
-                return 3 # 通常
+                if r['penalty_left'] <= 5: return 1 
+                elif r['days_held'] <= 3: return 2
+                return 3
             
             df_sorted['rank'] = df_sorted.apply(get_rank, axis=1)
-            # rank昇順(1->2->3), days_held降順(古い順)
             df_sorted = df_sorted.sort_values(['rank', 'days_held'], ascending=[True, False])
             
-            # スライダーの数だけ切り出し
             top_n = df_sorted.head(display_count)
             
             if not top_n.empty:
-                st.caption(f"優先度の高い順に {len(top_n)} 件を表示:")
-                st.code(" / ".join(top_n['シリアルナンバー'].tolist()), language="text")
+                # コピー用一覧は削除済み
                 
-                # カード表示 (4列カラム)
+                # カード表示 (標準機能によりスマホは縦1列、PCは横4列になる)
                 cols = st.columns(4)
                 for idx, (i, row) in enumerate(top_n.iterrows()):
                     col = cols[idx % 4]
