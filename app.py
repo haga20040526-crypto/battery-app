@@ -176,6 +176,24 @@ def replenish_data_bulk(serials, zone_name, base_price, current_week_count, toda
         
     return len(rows_to_delete), vol_bonus
 
+def delete_data_by_serial(serial):
+    """指定したシリアルナンバーを在庫から削除する"""
+    client = get_connection()
+    sheet = client.open(SHEET_NAME).sheet1
+    
+    all_records = sheet.get_all_records()
+    df = pd.DataFrame(all_records)
+    if df.empty: return False
+
+    df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
+    target = df[df['シリアルナンバー'] == str(serial)]
+    
+    if not target.empty:
+        row_idx = target.index[0] + 2
+        sheet.delete_rows(row_idx)
+        return True
+    return False
+
 def add_manual_history(date_obj, amount, memo, category):
     client = get_connection()
     hist_sheet = client.open(SHEET_NAME).worksheet(HISTORY_SHEET_NAME)
@@ -183,54 +201,59 @@ def add_manual_history(date_obj, amount, memo, category):
     row = [category, "-", date_str, "-", amount, memo]
     hist_sheet.append_row(row)
 
-# --- ★修正版: カード表示用HTML生成関数 ---
-def create_card_html(row, today):
+# --- カード表示関数: 在庫リスト用（SN重視） ---
+def create_inventory_card_html(row, today):
     p_days = PENALTY_LIMIT_DAYS - (today - row['保有開始日']).days
     days_held = (today - row['保有開始日']).days
     serial = row['シリアルナンバー']
     last4 = serial[-4:] if len(serial) >= 4 else serial
     start_date_str = row['保有開始日'].strftime('%m/%d')
     
-    # 優先度計算
     if p_days <= 5: priority = 1
     elif days_held <= 3: priority = 2
     else: priority = 3
 
     if priority == 1:
-        # 赤 (要返却)
         border, text_c, status = "#e57373", "#c62828", f"🔥 要返却 (残{p_days}日)"
         bg_c = "#fff5f5"
     elif priority == 2:
-        # 緑 (Bonus)
-        border, text_c, status = "#81c784", "#2e7d32", "💎 Bonus期間"
+        border, text_c, status = "#81c784", "#2e7d32", "💎 Bonus"
         bg_c = "#f1f8e9"
     else:
-        # 通常
         border, text_c, status = "#bdbdbd", "#616161", f"🐢 通常 (残{p_days}日)"
         bg_c = "#ffffff"
     
-    # デザイン刷新: 日付をメインに、SNを小さく
     return f"""
-    <div style="
-        background-color: {bg_c}; 
-        border-radius: 8px; 
-        border-left: 8px solid {border}; 
-        box-shadow: 0 2px 5px rgba(0,0,0,0.1); 
-        padding: 12px; 
-        margin-bottom: 12px;
-    ">
-        <div style="font-size: 12px; font-weight: bold; color: {text_c}; margin-bottom: 4px;">
-            {status}
+    <div style="background-color: {bg_c}; border-radius: 8px; border-left: 8px solid {border}; 
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1); padding: 12px; margin-bottom: 12px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+            <div style="font-size: 12px; font-weight: bold; color: {text_c};">{status}</div>
+            <div style="font-size: 12px; font-weight: bold; color: #555;">{start_date_str}〜</div>
         </div>
-        <div style="display: flex; align-items: baseline; justify-content: space-between;">
-            <div style="font-size: 36px; font-weight: 900; color: #212121; line-height: 1;">
-                {start_date_str}
-            </div>
-            <div style="font-size: 16px; font-weight: bold; color: #555;">
-                {days_held}日目
-            </div>
+        <div style="font-size: 34px; font-weight: 900; color: #212121; line-height: 1.1; letter-spacing: 1px;">
+            {last4}
         </div>
-        <div style="text-align: right; font-size: 11px; color: #999; margin-top: 6px; font-family: monospace;">
+        <div style="text-align: right; font-size: 10px; color: #999; font-family: monospace;">
+            {serial}
+        </div>
+    </div>
+    """
+
+# --- カード表示関数: 検索結果用（日付重視） ---
+def create_search_card_html(row, today):
+    days_held = (today - row['保有開始日']).days
+    serial = row['シリアルナンバー']
+    start_date_str = row['保有開始日'].strftime('%Y-%m-%d')
+    
+    return f"""
+    <div style="background-color: #e3f2fd; border-radius: 8px; border: 1px solid #90caf9;
+        padding: 15px; margin-bottom: 10px; text-align: center;">
+        <div style="font-size: 14px; color: #1565c0; margin-bottom: 5px;">保管開始日</div>
+        <div style="font-size: 32px; font-weight: 900; color: #0d47a1;">{start_date_str}</div>
+        <div style="font-size: 18px; font-weight: bold; color: #1976d2; margin-top: 5px;">
+            経過日数: {days_held}日目
+        </div>
+        <div style="font-size: 12px; color: #555; margin-top: 10px; border-top: 1px dashed #bbdefb; padding-top: 5px;">
             SN: {serial}
         </div>
     </div>
@@ -240,7 +263,6 @@ def create_card_html(row, today):
 def main():
     st.set_page_config(page_title="Battery Manager", page_icon="⚡", layout="wide")
     
-    # CSS: スライダー調整
     st.markdown("""
         <style>
         .stSlider { padding-top: 1rem; }
@@ -249,17 +271,14 @@ def main():
     
     today = get_today_jst()
 
-    # セッション
     if 'parsed_data' not in st.session_state:
         st.session_state['parsed_data'] = None
     if 'search_sn' not in st.session_state:
         st.session_state['search_sn'] = ""
 
-    # データ読み込み
     df = get_data()
     hist_df = get_history()
 
-    # 集計
     week_earnings = 0
     week_count = 0
     total_earnings = 0
@@ -274,7 +293,6 @@ def main():
 
     current_bonus = get_vol_bonus(week_count)
 
-    # --- タブ ---
     tab_home, tab_search, tab_inventory, tab_history = st.tabs(["🏠 ホーム", "🔍 個別検索", "📦 在庫", "💰 収益"])
 
     # 🏠 ホーム
@@ -352,11 +370,9 @@ def main():
                 extracted = extract_serials_only(input_text)
                 if extracted:
                     st.info(f"{len(extracted)} 件を検出しました")
-                    
                     base_price = ZONES[selected_zone_name]
                     est_bonus = get_vol_bonus(week_count + len(extracted))
                     est_total_price = base_price + est_bonus
-                    
                     st.metric("適用単価", f"¥{est_total_price}", f"基準{base_price}+ボ{est_bonus}")
 
                     if st.button("補充を確定する", type="primary", use_container_width=True, icon=":material/check_circle:"):
@@ -368,11 +384,11 @@ def main():
                             time.sleep(2)
                             st.rerun()
                         else:
-                            st.error("エラー: 在庫が見つかりません")
+                            st.error("エラー: 在庫から該当番号が見つかりませんでした (番号違いの可能性があります)")
         
         st.divider()
         
-        # --- おすすめリスト ---
+        # --- おすすめリスト (SN重視) ---
         col_title, col_slider = st.columns([2, 1])
         with col_title:
             st.subheader("ピックアップ推奨")
@@ -385,24 +401,21 @@ def main():
             df_sorted['penalty_left'] = PENALTY_LIMIT_DAYS - df_sorted['days_held']
             
             def get_rank(r):
-                if r['penalty_left'] <= 5: return 1 # 要返却
-                elif r['days_held'] <= 3: return 2  # Bonus
-                return 3 # 通常
+                if r['penalty_left'] <= 5: return 1 
+                elif r['days_held'] <= 3: return 2
+                return 3
             
             df_sorted['rank'] = df_sorted.apply(get_rank, axis=1)
-            # ソート: ランク(1->2->3) > 日数(多い順＝古い順)
             df_sorted = df_sorted.sort_values(['rank', 'days_held'], ascending=[True, False])
-            
             top_n = df_sorted.head(display_count)
             
             if not top_n.empty:
-                # 4つずつ表示（スマホ対応）
                 for i in range(0, len(top_n), 4):
                     chunk = top_n.iloc[i:i+4]
                     cols = st.columns(4)
                     for idx, (_, row) in enumerate(chunk.iterrows()):
                         with cols[idx]:
-                            st.markdown(create_card_html(row, today), unsafe_allow_html=True)
+                            st.markdown(create_inventory_card_html(row, today), unsafe_allow_html=True)
             else:
                 st.info("表示対象なし")
 
@@ -422,7 +435,7 @@ def main():
             if not hits.empty:
                 st.success(f"{len(hits)} 件ヒット")
                 for _, row in hits.iterrows():
-                    st.markdown(create_card_html(row, today), unsafe_allow_html=True)
+                    st.markdown(create_search_card_html(row, today), unsafe_allow_html=True)
             else:
                 if len(search_term) >= 4:
                     st.warning("⚠️ 在庫なし")
@@ -442,6 +455,26 @@ def main():
             st.metric("現在の在庫総数", f"{len(df)} 本")
             st.divider()
 
+            # --- 削除機能 ---
+            with st.expander("🗑️ 在庫から削除 (エラー補充対応)", expanded=True):
+                st.caption("エラーで補充報告できなかったバッテリーなどを、在庫リストから手動で消去します。")
+                del_serial = st.text_input("削除するシリアルナンバー (8桁)", placeholder="例: 34123995")
+                if st.button("削除を実行", type="primary"):
+                    if del_serial:
+                        with st.spinner("削除中..."):
+                            success = delete_data_by_serial(del_serial)
+                        if success:
+                            st.success(f"✅ {del_serial} を在庫から削除しました")
+                            import time
+                            time.sleep(2)
+                            st.rerun()
+                        else:
+                            st.error("⚠️ その番号は在庫に見つかりませんでした")
+                    else:
+                        st.warning("番号を入力してください")
+            
+            st.divider()
+
             st.markdown("##### 📅 取得日別の本数")
             date_counts = df['保有開始日'].value_counts().sort_index(ascending=False)
             date_summary = pd.DataFrame({'取得日': date_counts.index, '本数': date_counts.values})
@@ -452,12 +485,6 @@ def main():
             st.markdown("##### 全リスト")
             df_disp = df.copy()
             df_disp['days_held'] = df_disp['保有開始日'].apply(lambda x: (today - x).days)
-            def get_rank_simple(r):
-                if (PENALTY_LIMIT_DAYS - r['days_held']) <= 5: return 1
-                elif r['days_held'] <= 3: return 2
-                return 3
-            df_disp['rank'] = df_disp.apply(get_rank_simple, axis=1)
-            df_disp = df_disp.sort_values(['rank', 'days_held'], ascending=[True, False])
             df_disp['保有開始日'] = df_disp['保有開始日'].apply(lambda x: x.strftime('%Y-%m-%d'))
             df_disp = df_disp.rename(columns={'days_held': '経過日数'})
             st.dataframe(df_disp[['シリアルナンバー', '保有開始日', '経過日数']], use_container_width=True, hide_index=True)
