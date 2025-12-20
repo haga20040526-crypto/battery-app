@@ -50,27 +50,51 @@ def extract_serials_with_date(text, default_date):
     results = []
     default_date_str = default_date.strftime('%Y-%m-%d')
 
+    # SpotJobsのテキスト形式に対応（日付があれば取得、なければ基準日）
+    # 想定: "シリアルナンバー: 12345678" や "12345678" など
+    
+    # ブロックごとの処理（日付とセットになっている場合）
     if "シリアルナンバー" in text:
         blocks = text.split("シリアルナンバー")
         for block in blocks:
             s_match = re.search(r'[:：]?\s*(\d{8})', block)
             if s_match:
                 serial = s_match.group(1)
-                d_match = re.search(r'(\d{4}-\d{2}-\d{2})', block)
+                # 日付を探す (YYYY-MM-DD や YYYY/MM/DD)
+                d_match = re.search(r'(\d{4}[-/]\d{2}[-/]\d{2})', block)
                 if d_match:
-                    results.append((serial, d_match.group(1)))
+                    d_str = d_match.group(1).replace('/', '-')
+                    results.append((serial, d_str))
                 else:
                     results.append((serial, default_date_str))
     else:
+        # シンプルな羅列の場合
         serials = re.findall(r'\b\d{8}\b', text)
         for s in serials:
             results.append((s, default_date_str))
             
+    # 重複除去（後勝ち）
     unique_map = {r[0]: r[1] for r in results}
     return list(unique_map.items())
 
 def extract_serials_only(text):
     return list(set(re.findall(r'\b\d{8}\b', text)))
+
+# --- ★カスタムソートロジック（日付 > 下1桁 > 下2桁...） ---
+def sort_batteries(df):
+    if df.empty:
+        return df
+    
+    # ソート用のキーを作成
+    # 1. 日付
+    # 2. シリアルナンバーを逆順にした文字列（下1桁、下2桁...の順で評価される）
+    df['sort_serial'] = df['シリアルナンバー'].apply(lambda x: x[::-1]) # 文字列反転
+    
+    df_sorted = df.sort_values(by=['保有開始日', 'sort_serial'], ascending=[True, True])
+    
+    # 一時カラム削除
+    df_sorted = df_sorted.drop(columns=['sort_serial'])
+    return df_sorted
 
 # --- データ取得 ---
 def get_data():
@@ -84,8 +108,11 @@ def get_data():
         
         df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
         df['保有開始日'] = pd.to_datetime(df['保有開始日'], errors='coerce').dt.date
-        df = df.dropna(subset=['保有開始日']) 
-        return df
+        df = df.dropna(subset=['保有開始日'])
+        
+        # ★ここでカスタムソート適用
+        return sort_batteries(df)
+        
     except: return pd.DataFrame(columns=['シリアルナンバー', '保有開始日'])
 
 def get_history():
@@ -98,6 +125,7 @@ def get_history():
         expected_cols = ['シリアルナンバー', '保有開始日', '補充日', '補充エリア', '確定報酬額', '備考']
         if df.empty: return pd.DataFrame(columns=expected_cols)
         
+        df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
         df['確定報酬額'] = pd.to_numeric(df['確定報酬額'], errors='coerce').fillna(0).astype(int)
         df['補充日'] = pd.to_datetime(df['補充日'], errors='coerce').dt.date
         return df
@@ -143,10 +171,11 @@ def replenish_data_bulk(serials, zone_name, base_price, current_week_count, toda
     df = pd.DataFrame(all_records)
     if df.empty: return 0, 0
 
+    df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
+    
     rows_to_delete = []
     history_rows = []
     
-    df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
     total_count_for_bonus = current_week_count + len(serials)
     vol_bonus = get_vol_bonus(total_count_for_bonus)
     date_str = today_date.strftime('%Y-%m-%d')
@@ -157,6 +186,7 @@ def replenish_data_bulk(serials, zone_name, base_price, current_week_count, toda
             start_date = pd.to_datetime(target.iloc[0]['保有開始日']).date()
             row_idx = target.index[0] + 2
             rows_to_delete.append(row_idx)
+            
             days_held = (today_date - start_date).days
             price = base_price + vol_bonus
             is_early = days_held <= 3
@@ -177,22 +207,72 @@ def replenish_data_bulk(serials, zone_name, base_price, current_week_count, toda
     return len(rows_to_delete), vol_bonus
 
 def delete_data_by_serial(serial):
-    """指定したシリアルナンバーを在庫から削除する"""
     client = get_connection()
     sheet = client.open(SHEET_NAME).sheet1
-    
     all_records = sheet.get_all_records()
     df = pd.DataFrame(all_records)
     if df.empty: return False
-
     df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
     target = df[df['シリアルナンバー'] == str(serial)]
-    
     if not target.empty:
         row_idx = target.index[0] + 2
         sheet.delete_rows(row_idx)
         return True
     return False
+
+# --- ★棚卸し用：アーカイブ処理（削除データを履歴へ） ---
+def archive_missing_items(serials, today_date):
+    """手元にないアイテムを在庫から削除し、履歴に「棚卸不明」として残す"""
+    client = get_connection()
+    db_sheet = client.open(SHEET_NAME).sheet1
+    hist_sheet = client.open(SHEET_NAME).worksheet(HISTORY_SHEET_NAME)
+    
+    all_records = db_sheet.get_all_records()
+    df = pd.DataFrame(all_records)
+    df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
+    
+    rows_to_delete = []
+    history_rows = []
+    date_str = today_date.strftime('%Y-%m-%d')
+
+    for s in serials:
+        target = df[df['シリアルナンバー'] == str(s)]
+        if not target.empty:
+            start_date = pd.to_datetime(target.iloc[0]['保有開始日']).date()
+            row_idx = target.index[0] + 2
+            rows_to_delete.append(row_idx)
+            # 履歴には残すが、報酬は0円
+            history_rows.append([
+                str(s), str(start_date), date_str, "棚卸", 0, "棚卸削除(手元なし)"
+            ])
+
+    if history_rows:
+        hist_sheet.append_rows(history_rows)
+
+    rows_to_delete.sort(reverse=True)
+    for r in rows_to_delete:
+        db_sheet.delete_rows(r)
+    
+    return len(rows_to_delete)
+
+# --- ★棚卸し用：日付更新処理 ---
+def update_inventory_dates(updates_list):
+    """日付ズレがあるアイテムの日付を更新する"""
+    client = get_connection()
+    sheet = client.open(SHEET_NAME).sheet1
+    all_records = sheet.get_all_records()
+    
+    # シリアル -> 行番号 のマップ
+    serial_to_row = {str(row['シリアルナンバー']): i + 2 for i, row in enumerate(all_records)}
+    
+    update_count = 0
+    for s, new_date in updates_list:
+        if str(s) in serial_to_row:
+            row_idx = serial_to_row[str(s)]
+            # 列2(B列)が日付と仮定
+            sheet.update_cell(row_idx, 2, new_date)
+            update_count += 1
+    return update_count
 
 def add_manual_history(date_obj, amount, memo, category):
     client = get_connection()
@@ -201,7 +281,7 @@ def add_manual_history(date_obj, amount, memo, category):
     row = [category, "-", date_str, "-", amount, memo]
     hist_sheet.append_row(row)
 
-# --- カード表示関数: 在庫リスト用（SN重視） ---
+# --- カード表示用 ---
 def create_inventory_card_html(row, today):
     p_days = PENALTY_LIMIT_DAYS - (today - row['保有開始日']).days
     days_held = (today - row['保有開始日']).days
@@ -239,21 +319,23 @@ def create_inventory_card_html(row, today):
     </div>
     """
 
-# --- カード表示関数: 検索結果用（日付重視） ---
 def create_search_card_html(row, today):
     days_held = (today - row['保有開始日']).days
     serial = row['シリアルナンバー']
     start_date_str = row['保有開始日'].strftime('%Y-%m-%d')
     
     return f"""
-    <div style="background-color: #e3f2fd; border-radius: 8px; border: 1px solid #90caf9;
-        padding: 15px; margin-bottom: 10px; text-align: center;">
-        <div style="font-size: 14px; color: #1565c0; margin-bottom: 5px;">保管開始日</div>
-        <div style="font-size: 32px; font-weight: 900; color: #0d47a1;">{start_date_str}</div>
-        <div style="font-size: 18px; font-weight: bold; color: #1976d2; margin-top: 5px;">
-            経過日数: {days_held}日目
+    <div style="background-color: #ffffff; border-radius: 12px; border: 1px solid #e0e0e0;
+        padding: 15px; margin-bottom: 10px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+        
+        <div style="font-size: 13px; color: #757575; margin-bottom: 4px;">保管開始日</div>
+        <div style="font-size: 42px; font-weight: 900; color: #212121; line-height: 1.1; letter-spacing: 1px;">{start_date_str}</div>
+        
+        <div style="font-size: 18px; font-weight: bold; color: #424242; margin-top: 8px; background-color: #f5f5f5; display: inline-block; padding: 4px 12px; border-radius: 20px;">
+            経過 {days_held}日目
         </div>
-        <div style="font-size: 12px; color: #555; margin-top: 10px; border-top: 1px dashed #bbdefb; padding-top: 5px;">
+
+        <div style="font-size: 12px; color: #bdbdbd; margin-top: 15px; padding-top: 8px; border-top: 1px solid #f0f0f0; font-family: monospace; text-align: right;">
             SN: {serial}
         </div>
     </div>
@@ -271,29 +353,34 @@ def main():
     
     today = get_today_jst()
 
+    # セッション初期化
     if 'parsed_data' not in st.session_state:
         st.session_state['parsed_data'] = None
     if 'search_sn' not in st.session_state:
         st.session_state['search_sn'] = ""
+    # 棚卸し用バッファ
+    if 'stocktake_buffer' not in st.session_state:
+        st.session_state['stocktake_buffer'] = []
 
-    df = get_data()
+    df = get_data() # ここでカスタムソート済み
     hist_df = get_history()
 
+    # 集計
     week_earnings = 0
     week_count = 0
     total_earnings = 0
-    
     if not hist_df.empty:
         start_of_week = today - datetime.timedelta(days=today.weekday())
         weekly_df = hist_df[hist_df['補充日'] >= start_of_week]
-        real_jobs_df = weekly_df[~weekly_df['シリアルナンバー'].isin(["手動修正", "過去分", "調整"])]
+        real_jobs_df = weekly_df[~weekly_df['シリアルナンバー'].isin(["手動修正", "過去分", "調整", "棚卸"])]
         week_count = len(real_jobs_df)
         week_earnings = weekly_df['確定報酬額'].sum()
         total_earnings = hist_df['確定報酬額'].sum()
 
     current_bonus = get_vol_bonus(week_count)
 
-    tab_home, tab_search, tab_inventory, tab_history = st.tabs(["🏠 ホーム", "🔍 個別検索", "📦 在庫", "💰 収益"])
+    # --- タブ ---
+    tab_home, tab_search, tab_stocktake, tab_inventory, tab_history = st.tabs(["🏠 ホーム", "🔍 個別検索", "📝 棚卸し", "📦 在庫", "💰 収益"])
 
     # 🏠 ホーム
     with tab_home:
@@ -315,9 +402,9 @@ def main():
         job_mode = st.radio("作業モード", ["取出 (在庫登録)", "補充 (報酬確定)"], horizontal=True)
 
         if job_mode == "取出 (在庫登録)":
-            st.caption("「バッテリー管理」画面のリスト全体をペースト")
+            st.caption("SpotJobsアプリのリストをペーストして登録します。")
             default_date = st.date_input("基準日 (読取不可時)", value=today)
-            input_text = st.text_area("テキスト貼付", height=150, placeholder="ここにペースト...")
+            input_text = st.text_area("テキスト貼付", height=100, placeholder="ここにペースト...")
             
             if st.button("読込 (内容確認)", type="secondary", icon=":material/search:"):
                 if input_text:
@@ -355,8 +442,7 @@ def main():
                         st.rerun()
 
         elif job_mode == "補充 (報酬確定)":
-            st.caption("補充したバッテリー番号リストをペースト")
-            
+            st.caption("補充したバッテリーを在庫から消し、報酬履歴に追加します。")
             col_date, col_area = st.columns([1, 1])
             with col_date:
                 target_date = st.date_input("補充日", value=today)
@@ -384,11 +470,11 @@ def main():
                             time.sleep(2)
                             st.rerun()
                         else:
-                            st.error("エラー: 在庫から該当番号が見つかりませんでした (番号違いの可能性があります)")
+                            st.error("エラー: 在庫から該当番号が見つかりませんでした")
         
         st.divider()
         
-        # --- おすすめリスト (SN重視) ---
+        # --- おすすめリスト (SN重視 & カスタムソート) ---
         col_title, col_slider = st.columns([2, 1])
         with col_title:
             st.subheader("ピックアップ推奨")
@@ -396,22 +482,42 @@ def main():
             display_count = st.slider("表示数", 1, 20, 7)
 
         if not df.empty:
-            df_sorted = df.copy() 
-            df_sorted['days_held'] = df_sorted['保有開始日'].apply(lambda x: (today - x).days)
-            df_sorted['penalty_left'] = PENALTY_LIMIT_DAYS - df_sorted['days_held']
+            # 基本は「カスタムソート済み」のdfを使うが、ここではさらに
+            # 「優先度(期限)」を加味して並べ替える必要があるか？
+            # ユーザー要望: 「管理のしやすさを考え、下1桁の小さい順とします」
+            # -> つまり、おすすめ表示も「日付ごと」にまとまっていて、その中で「下1桁順」が望ましいはず。
+            # -> 既存のdfは既にその順序になっている。
             
+            # ただし、「要返却」を上に持ってきたいなら並べ替えが必要。
+            # 今回は「管理（探す）」重視なので、dfのソート順（日付＞下桁）を維持しつつ、
+            # 上から「期限が近いもの」を表示するフィルタリングを行うのがベスト。
+            
+            # まずはペナルティ期限順に並べないと「推奨」にならないので、
+            # 推奨ロジックを通した後に、表示順序だけ「下桁順」にするのが親切。
+            
+            df_rec = df.copy()
+            df_rec['days_held'] = df_rec['保有開始日'].apply(lambda x: (today - x).days)
+            df_rec['penalty_left'] = PENALTY_LIMIT_DAYS - df_rec['days_held']
+            
+            # 優先度ランク付け
             def get_rank(r):
                 if r['penalty_left'] <= 5: return 1 
                 elif r['days_held'] <= 3: return 2
                 return 3
+            df_rec['rank'] = df_rec.apply(get_rank, axis=1)
             
-            df_sorted['rank'] = df_sorted.apply(get_rank, axis=1)
-            df_sorted = df_sorted.sort_values(['rank', 'days_held'], ascending=[True, False])
-            top_n = df_sorted.head(display_count)
+            # 抽出: まずは優先度が高いものからN個選ぶ
+            # ここでは「ランク昇順」＞「日付古い順」でTopNを選ぶ
+            df_rec_sorted = df_rec.sort_values(['rank', 'days_held'], ascending=[True, False])
+            top_n = df_rec_sorted.head(display_count)
             
-            if not top_n.empty:
-                for i in range(0, len(top_n), 4):
-                    chunk = top_n.iloc[i:i+4]
+            # 表示: 選ばれたN個を、ユーザー指定の「管理しやすい順（日付＞下桁）」に並べ直して表示
+            # (sort_batteries関数を再利用)
+            top_n_display = sort_batteries(top_n)
+            
+            if not top_n_display.empty:
+                for i in range(0, len(top_n_display), 4):
+                    chunk = top_n_display.iloc[i:i+4]
                     cols = st.columns(4)
                     for idx, (_, row) in enumerate(chunk.iterrows()):
                         with cols[idx]:
@@ -448,6 +554,105 @@ def main():
         else:
             st.info("👆 ボックスをタップして番号を入力してください")
 
+    # 📝 棚卸し (新機能)
+    with tab_stocktake:
+        st.markdown("### 📝 在庫棚卸し")
+        st.caption("SpotJobsの保有リストを貼り付けて、ズレを確認します。")
+        
+        # バッファの表示
+        current_buffer = st.session_state['stocktake_buffer']
+        st.info(f"現在読み込み済み: {len(current_buffer)} 本")
+        
+        with st.expander("データの追加読込", expanded=True):
+            stock_input = st.text_area("リスト貼り付け (分割可)", height=100)
+            c_add, c_clear = st.columns([1, 1])
+            with c_add:
+                if st.button("リストに追加", type="primary", icon=":material/add:"):
+                    if stock_input:
+                        new_items = extract_serials_with_date(stock_input, today)
+                        if new_items:
+                            # 既存リストに追加
+                            st.session_state['stocktake_buffer'].extend(new_items)
+                            # 重複排除（シリアルナンバーでユニーク化）
+                            unique_buffer = {}
+                            for s, d in st.session_state['stocktake_buffer']:
+                                unique_buffer[s] = d
+                            st.session_state['stocktake_buffer'] = list(unique_buffer.items())
+                            st.rerun()
+            with c_clear:
+                if st.button("リセット", icon=":material/delete:"):
+                    st.session_state['stocktake_buffer'] = []
+                    st.rerun()
+
+        st.divider()
+        
+        if st.button("照合開始", type="primary", use_container_width=True) and not df.empty and current_buffer:
+            # 照合ロジック
+            stock_map = {s: d for s, d in current_buffer} # 手元のデータ
+            db_map = dict(zip(df['シリアルナンバー'], df['保有開始日'])) # アプリのデータ
+            
+            # 日付文字列を比較用に統一
+            def fmt_date(d):
+                return pd.to_datetime(d).strftime('%Y-%m-%d')
+
+            missing_in_db = [] # A: アプリにない (新規登録)
+            missing_in_hand = [] # B: 手元にない (紛失/補充漏れ -> 履歴へ移動)
+            date_mismatch = [] # C: 日付ズレ
+            
+            # A Check
+            for s, d in stock_map.items():
+                if s not in db_map:
+                    missing_in_db.append((s, d))
+                else:
+                    # C Check
+                    db_date = fmt_date(db_map[s])
+                    hand_date = fmt_date(d)
+                    if db_date != hand_date:
+                        date_mismatch.append((s, hand_date, db_date)) # Serial, New, Old
+            
+            # B Check
+            for s in db_map.keys():
+                if s not in stock_map:
+                    missing_in_hand.append(s)
+            
+            # 結果表示
+            if not missing_in_db and not missing_in_hand and not date_mismatch:
+                st.success("🎉 ズレはありません！完璧です！")
+            else:
+                # A: 未登録
+                if missing_in_db:
+                    st.warning(f"🚨 未登録のバッテリー: {len(missing_in_db)} 件")
+                    with st.expander("詳細＆登録"):
+                        st.dataframe(pd.DataFrame(missing_in_db, columns=["SN", "日付"]), hide_index=True)
+                        if st.button("一括登録する"):
+                            add_data_bulk_with_dates(missing_in_db)
+                            st.success("登録しました")
+                            st.rerun()
+                
+                # B: 手元になし
+                if missing_in_hand:
+                    st.error(f"⚠️ 手元に無い (アプリのみ存在): {len(missing_in_hand)} 件")
+                    with st.expander("詳細＆削除処理"):
+                        st.write(", ".join(missing_in_hand))
+                        st.caption("※これらは「棚卸不明」として在庫から消し、履歴に残します（データは消えません）。")
+                        if st.button("一括処理 (履歴へ移動)"):
+                            count = archive_missing_items(missing_in_hand, today)
+                            st.success(f"{count} 件を処理しました")
+                            st.rerun()
+
+                # C: 日付ズレ
+                if date_mismatch:
+                    st.info(f"📅 日付ズレ: {len(date_mismatch)} 件")
+                    with st.expander("詳細＆更新"):
+                        mismatch_df = pd.DataFrame(date_mismatch, columns=["SN", "正しい日付(手元)", "古い日付(アプリ)"])
+                        st.dataframe(mismatch_df, hide_index=True)
+                        if st.button("日付を更新する"):
+                            # 更新用リスト作成 ((sn, new_date), ...)
+                            updates = [(item[0], item[1]) for item in date_mismatch]
+                            cnt = update_inventory_dates(updates)
+                            st.success(f"{cnt} 件の日付を更新しました")
+                            st.rerun()
+
     # 📦 在庫
     with tab_inventory:
         st.subheader("📦 在庫詳細")
@@ -455,23 +660,15 @@ def main():
             st.metric("現在の在庫総数", f"{len(df)} 本")
             st.divider()
 
-            # --- 削除機能 ---
-            with st.expander("🗑️ 在庫から削除 (エラー補充対応)", expanded=True):
-                st.caption("エラーで補充報告できなかったバッテリーなどを、在庫リストから手動で消去します。")
-                del_serial = st.text_input("削除するシリアルナンバー (8桁)", placeholder="例: 34123995")
-                if st.button("削除を実行", type="primary"):
-                    if del_serial:
-                        with st.spinner("削除中..."):
-                            success = delete_data_by_serial(del_serial)
-                        if success:
-                            st.success(f"✅ {del_serial} を在庫から削除しました")
-                            import time
-                            time.sleep(2)
-                            st.rerun()
-                        else:
-                            st.error("⚠️ その番号は在庫に見つかりませんでした")
-                    else:
-                        st.warning("番号を入力してください")
+            # 削除機能
+            with st.expander("🗑️ 在庫から削除 (エラー補充対応)", expanded=False):
+                del_serial = st.text_input("削除するシリアルナンバー (8桁)")
+                if st.button("削除を実行"):
+                    if delete_data_by_serial(del_serial):
+                        st.success(f"✅ {del_serial} を削除しました")
+                        import time
+                        time.sleep(1)
+                        st.rerun()
             
             st.divider()
 
@@ -482,12 +679,11 @@ def main():
             st.dataframe(date_summary, hide_index=True, use_container_width=True)
             st.divider()
 
-            st.markdown("##### 全リスト")
+            st.markdown("##### 全リスト (日付順 > 下1桁順)")
+            # 既にカスタムソート済みのdfを表示
             df_disp = df.copy()
-            df_disp['days_held'] = df_disp['保有開始日'].apply(lambda x: (today - x).days)
             df_disp['保有開始日'] = df_disp['保有開始日'].apply(lambda x: x.strftime('%Y-%m-%d'))
-            df_disp = df_disp.rename(columns={'days_held': '経過日数'})
-            st.dataframe(df_disp[['シリアルナンバー', '保有開始日', '経過日数']], use_container_width=True, hide_index=True)
+            st.dataframe(df_disp, use_container_width=True, hide_index=True)
         else:
             st.info("在庫はありません")
 
@@ -516,34 +712,15 @@ def main():
             ).interactive()
             st.altair_chart(chart, use_container_width=True)
 
-        st.divider()
-
-        with st.expander("🛠 訂正・過去分登録・調整"):
-            st.info("通常は自動計算されます。金額が合わない時の修正や、過去データを登録する時のみ使用してください。")
-            adjust_type = st.radio("種別", ["訂正・調整 (+/-)", "過去分 (初期登録)"], horizontal=True)
+        with st.expander("🛠 訂正・過去分登録"):
             with st.form("manual_history_form"):
                 col_d, col_a = st.columns([1, 1])
                 m_date = col_d.date_input("日付", value=today)
-                if adjust_type == "訂正・調整 (+/-)":
-                    m_amount = col_a.number_input("調整額 (円)", value=0, step=10, help="足りない場合はプラス、引きたい場合はマイナスを入力")
-                    m_memo = st.text_input("理由", placeholder="例: 70円計算だが実際は80円だったため+10円")
-                    category = "手動修正"
-                else:
-                    m_amount = col_a.number_input("売上額 (円)", value=0, step=100)
-                    m_memo = st.text_input("備考", placeholder="例: アプリ導入前の12月分合算")
-                    category = "過去分"
-                
-                submitted = st.form_submit_button("履歴に追加", type="primary")
-                if submitted:
-                    if m_amount != 0:
-                        with st.spinner("処理中..."):
-                            add_manual_history(m_date, m_amount, m_memo, category)
-                        st.success("履歴に追加しました")
-                        import time
-                        time.sleep(1)
-                        st.rerun()
-                    else:
-                        st.error("金額を入力してください")
+                m_amount = col_a.number_input("金額 (円)", step=10)
+                m_memo = st.text_input("備考")
+                if st.form_submit_button("追加"):
+                    add_manual_history(m_date, m_amount, m_memo, "手動")
+                    st.rerun()
 
         st.markdown("#### 履歴一覧")
         if not hist_df.empty:
