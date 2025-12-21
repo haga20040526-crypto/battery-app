@@ -5,6 +5,7 @@ from google.oauth2.service_account import Credentials
 import datetime
 import re
 import altair as alt
+import textwrap  # 追加: HTMLのインデントを安全に削除するため
 
 # --- 定数設定 ---
 PENALTY_LIMIT_DAYS = 28
@@ -74,7 +75,8 @@ def extract_serials_only(text):
 # --- カスタムソート: 日付 > 末尾の数字順 ---
 def sort_batteries(df):
     if df.empty: return df
-    df['rev_serial'] = df['シリアルナンバー'].apply(lambda x: x[::-1])
+    # エラー防止のため、確実に文字列型にしてから反転させる
+    df['rev_serial'] = df['シリアルナンバー'].astype(str).apply(lambda x: x[::-1])
     df_sorted = df.sort_values(by=['保有開始日', 'rev_serial'], ascending=[True, True])
     df_sorted = df_sorted.drop(columns=['rev_serial'])
     return df_sorted
@@ -224,7 +226,7 @@ def add_manual_history(date_obj, amount, memo, category):
     row = [category, "-", date_str, "-", amount, memo]
     hist_sheet.append_row(row)
 
-# --- カード表示: 在庫リスト用 (インデント削除版) ---
+# --- カード表示: 在庫リスト用 (修正版: textwrapを使用) ---
 def create_inventory_card_html(row, today):
     p_days = PENALTY_LIMIT_DAYS - (today - row['保有開始日']).days
     days_held = (today - row['保有開始日']).days
@@ -243,17 +245,48 @@ def create_inventory_card_html(row, today):
     else:
         border, text_c, status, bg_c = "#bdbdbd", "#616161", f"🐢 通常 (残{p_days}日)", "#ffffff"
     
-    # インデントを削除して1行にする、または左詰めで記述
-    return f"""<div style="background-color: {bg_c}; border-radius: 8px; border-left: 8px solid {border}; box-shadow: 0 2px 5px rgba(0,0,0,0.1); padding: 12px; margin-bottom: 12px;"><div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;"><div style="font-size: 12px; font-weight: bold; color: {text_c};">{status}</div><div style="font-size: 12px; font-weight: bold; color: #555;">{start_date_str}〜</div></div><div style="font-size: 34px; font-weight: 900; color: #212121; line-height: 1.1; letter-spacing: 1px;">{last4}</div><div style="text-align: right; font-size: 10px; color: #999; font-family: monospace;">{serial}</div></div>"""
+    # textwrap.dedentを使うことで、コード上のインデントは保ちつつ、
+    # 表示時には余計な空白を消して、Markdownのコードブロック誤認を防ぎます。
+    html = textwrap.dedent(f"""
+    <div style="background-color: {bg_c}; border-radius: 8px; border-left: 8px solid {border}; 
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1); padding: 12px; margin-bottom: 12px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+            <div style="font-size: 12px; font-weight: bold; color: {text_c};">{status}</div>
+            <div style="font-size: 12px; font-weight: bold; color: #555;">{start_date_str}〜</div>
+        </div>
+        <div style="font-size: 34px; font-weight: 900; color: #212121; line-height: 1.1; letter-spacing: 1px;">
+            {last4}
+        </div>
+        <div style="text-align: right; font-size: 10px; color: #999; font-family: monospace;">
+            {serial}
+        </div>
+    </div>
+    """)
+    return html
 
-# --- カード表示: 検索用 (インデント削除版) ---
+# --- カード表示: 検索用 (修正版: textwrapを使用) ---
 def create_search_card_html(row, today):
     days_held = (today - row['保有開始日']).days
     serial = row['シリアルナンバー']
     start_date_str = row['保有開始日'].strftime('%Y-%m-%d')
     
-    # HTMLタグの間に改行やインデントを入れないことでコードブロック化を防ぐ
-    return f"""<div style="background-color: #ffffff; border-radius: 12px; border: 1px solid #e0e0e0; padding: 15px; margin-bottom: 10px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05);"><div style="font-size: 13px; color: #757575; margin-bottom: 4px;">保管開始日</div><div style="font-size: 42px; font-weight: 900; color: #212121; line-height: 1.1; letter-spacing: 1px;">{start_date_str}</div><div style="font-size: 18px; font-weight: bold; color: #424242; margin-top: 8px; background-color: #f5f5f5; display: inline-block; padding: 4px 12px; border-radius: 20px;">経過 {days_held}日目</div><div style="font-size: 12px; color: #bdbdbd; margin-top: 15px; padding-top: 8px; border-top: 1px solid #f0f0f0; font-family: monospace; text-align: right;">SN: {serial}</div></div>"""
+    html = textwrap.dedent(f"""
+    <div style="background-color: #ffffff; border-radius: 12px; border: 1px solid #e0e0e0;
+        padding: 15px; margin-bottom: 10px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+        
+        <div style="font-size: 13px; color: #757575; margin-bottom: 4px;">保管開始日</div>
+        <div style="font-size: 42px; font-weight: 900; color: #212121; line-height: 1.1; letter-spacing: 1px;">{start_date_str}</div>
+        
+        <div style="font-size: 18px; font-weight: bold; color: #424242; margin-top: 8px; background-color: #f5f5f5; display: inline-block; padding: 4px 12px; border-radius: 20px;">
+            経過 {days_held}日目
+        </div>
+
+        <div style="font-size: 12px; color: #bdbdbd; margin-top: 15px; padding-top: 8px; border-top: 1px solid #f0f0f0; font-family: monospace; text-align: right;">
+            SN: {serial}
+        </div>
+    </div>
+    """)
+    return html
 
 # --- メイン処理 ---
 def main():
