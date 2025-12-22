@@ -5,7 +5,6 @@ from google.oauth2.service_account import Credentials
 import datetime
 import re
 import altair as alt
-import textwrap  # 追加: HTMLのインデントを安全に削除するため
 
 # --- 定数設定 ---
 PENALTY_LIMIT_DAYS = 28
@@ -75,7 +74,7 @@ def extract_serials_only(text):
 # --- カスタムソート: 日付 > 末尾の数字順 ---
 def sort_batteries(df):
     if df.empty: return df
-    # エラー防止のため、確実に文字列型にしてから反転させる
+    # 文字列型にしてから反転
     df['rev_serial'] = df['シリアルナンバー'].astype(str).apply(lambda x: x[::-1])
     df_sorted = df.sort_values(by=['保有開始日', 'rev_serial'], ascending=[True, True])
     df_sorted = df_sorted.drop(columns=['rev_serial'])
@@ -141,32 +140,77 @@ def replenish_data_bulk(serials, zone_name, base_price, current_week_count, toda
     client = get_connection()
     db_sheet = client.open(SHEET_NAME).sheet1
     hist_sheet = client.open(SHEET_NAME).worksheet(HISTORY_SHEET_NAME)
-    all_records = db_sheet.get_all_records()
-    df = pd.DataFrame(all_records)
-    if df.empty: return 0, 0
-    df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
-    rows_to_delete = []
+    
+    # 全データを取得してDF化
+    all_inv = db_sheet.get_all_records()
+    df_inv = pd.DataFrame(all_inv)
+    
+    # 履歴も取得（重複チェック用）
+    all_hist = hist_sheet.get_all_records()
+    df_hist = pd.DataFrame(all_hist)
+
+    if df_inv.empty: return 0, 0
+    
+    # 型統一
+    df_inv['シリアルナンバー'] = df_inv['シリアルナンバー'].astype(str)
+    if not df_hist.empty:
+        df_hist['シリアルナンバー'] = df_hist['シリアルナンバー'].astype(str)
+        df_hist['補充日'] = pd.to_datetime(df_hist['補充日'], errors='coerce').dt.date
+
+    # 処理対象のシリアル（在庫にあるものだけ）
+    target_serials = []
+    for s in serials:
+        if not df_inv[df_inv['シリアルナンバー'] == str(s)].empty:
+            target_serials.append(str(s))
+    
+    if not target_serials:
+        return 0, 0
+
     history_rows = []
-    total_count_for_bonus = current_week_count + len(serials)
+    total_count_for_bonus = current_week_count + len(target_serials)
     vol_bonus = get_vol_bonus(total_count_for_bonus)
     date_str = today_date.strftime('%Y-%m-%d')
-    for s in serials:
-        target = df[df['シリアルナンバー'] == str(s)]
-        if not target.empty:
-            start_date = pd.to_datetime(target.iloc[0]['保有開始日']).date()
-            row_idx = target.index[0] + 2
-            rows_to_delete.append(row_idx)
-            days_held = (today_date - start_date).days
-            price = base_price + vol_bonus
-            is_early = days_held <= 3
-            if is_early: price += 10
-            history_rows.append([str(s), str(start_date), date_str, zone_name, price, "早期ボーナス" if is_early else "-"])
+    
+    skipped_dupe = 0
+
+    for s in target_serials:
+        # 重複チェック: 今日すでに履歴にあればスキップ
+        if not df_hist.empty:
+            is_dupe = not df_hist[(df_hist['シリアルナンバー'] == s) & (df_hist['補充日'] == today_date)].empty
+            if is_dupe:
+                skipped_dupe += 1
+                continue
+
+        # 在庫データ取得
+        row_data = df_inv[df_inv['シリアルナンバー'] == s].iloc[0]
+        start_date = pd.to_datetime(row_data['保有開始日']).date()
+        days_held = (today_date - start_date).days
+        
+        # 報酬計算
+        price = base_price + vol_bonus
+        is_early = days_held <= 3
+        if is_early: price += 10
+        
+        history_rows.append([s, str(start_date), date_str, zone_name, price, "早期ボーナス" if is_early else "-"])
+
+    # 1. 履歴に追加
     if history_rows:
         hist_sheet.append_rows(history_rows)
-    rows_to_delete.sort(reverse=True)
-    for r in rows_to_delete:
-        db_sheet.delete_rows(r)
-    return len(rows_to_delete), vol_bonus
+    
+    # 2. 在庫から削除（書き換え方式）
+    # 処理対象となったシリアルを除外した新しいリストを作る
+    # (重複スキップされたものも、ここに含まれていれば削除する＝「履歴にあるなら在庫には不要」なので)
+    # 安全のため「今回処理対象として見つけたもの」を削除リストとする
+    
+    df_new_inv = df_inv[~df_inv['シリアルナンバー'].isin(target_serials)]
+    
+    # シートをクリアして書き直し（これが一番確実）
+    db_sheet.clear()
+    # ヘッダー + データ
+    update_data = [df_new_inv.columns.values.tolist()] + df_new_inv.values.tolist()
+    db_sheet.update(range_name=None, values=update_data)
+        
+    return len(history_rows), skipped_dupe
 
 def delete_data_by_serial(serial):
     client = get_connection()
@@ -175,48 +219,71 @@ def delete_data_by_serial(serial):
     df = pd.DataFrame(all_records)
     if df.empty: return False
     df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
-    target = df[df['シリアルナンバー'] == str(serial)]
-    if not target.empty:
-        row_idx = target.index[0] + 2
-        sheet.delete_rows(row_idx)
+    
+    # 該当しないものを残す（書き換え方式）
+    if not df[df['シリアルナンバー'] == str(serial)].empty:
+        df_new = df[df['シリアルナンバー'] != str(serial)]
+        sheet.clear()
+        update_data = [df_new.columns.values.tolist()] + df_new.values.tolist()
+        sheet.update(range_name=None, values=update_data)
         return True
     return False
 
 def archive_missing_items(serials, today_date):
+    """手元にない在庫を削除し、履歴に「棚卸」として保存（書き換え方式）"""
     client = get_connection()
     db_sheet = client.open(SHEET_NAME).sheet1
     hist_sheet = client.open(SHEET_NAME).worksheet(HISTORY_SHEET_NAME)
+    
     all_records = db_sheet.get_all_records()
     df = pd.DataFrame(all_records)
     df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
-    rows_to_delete = []
+    
+    target_serials = [str(s) for s in serials]
     history_rows = []
     date_str = today_date.strftime('%Y-%m-%d')
-    for s in serials:
-        target = df[df['シリアルナンバー'] == str(s)]
+
+    for s in target_serials:
+        target = df[df['シリアルナンバー'] == s]
         if not target.empty:
             start_date = pd.to_datetime(target.iloc[0]['保有開始日']).date()
-            row_idx = target.index[0] + 2
-            rows_to_delete.append(row_idx)
-            history_rows.append([str(s), str(start_date), date_str, "棚卸", 0, "棚卸削除(手元なし)"])
+            history_rows.append([s, str(start_date), date_str, "棚卸", 0, "棚卸削除(手元なし)"])
+
     if history_rows:
         hist_sheet.append_rows(history_rows)
-    rows_to_delete.sort(reverse=True)
-    for r in rows_to_delete:
-        db_sheet.delete_rows(r)
-    return len(rows_to_delete)
+
+    # 在庫書き換え
+    df_new = df[~df['シリアルナンバー'].isin(target_serials)]
+    db_sheet.clear()
+    update_data = [df_new.columns.values.tolist()] + df_new.values.tolist()
+    db_sheet.update(range_name=None, values=update_data)
+    
+    return len(history_rows)
 
 def update_inventory_dates(updates_list):
     client = get_connection()
     sheet = client.open(SHEET_NAME).sheet1
     all_records = sheet.get_all_records()
-    serial_to_row = {str(row['シリアルナンバー']): i + 2 for i, row in enumerate(all_records)}
+    
+    # 書き換え方式はコストが高いので、ここはCell Updateを使う（行特定ロジック修正）
+    # リストを再取得して行ズレを防ぐ
+    
+    # DFで処理して一括更新の方が安全
+    df = pd.DataFrame(all_records)
+    df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
+    
     update_count = 0
     for s, new_date in updates_list:
-        if str(s) in serial_to_row:
-            row_idx = serial_to_row[str(s)]
-            sheet.update_cell(row_idx, 2, new_date)
+        idx = df[df['シリアルナンバー'] == str(s)].index
+        if not idx.empty:
+            df.at[idx[0], '保有開始日'] = new_date
             update_count += 1
+            
+    if update_count > 0:
+        sheet.clear()
+        update_data = [df.columns.values.tolist()] + df.values.tolist()
+        sheet.update(range_name=None, values=update_data)
+        
     return update_count
 
 def add_manual_history(date_obj, amount, memo, category):
@@ -226,7 +293,7 @@ def add_manual_history(date_obj, amount, memo, category):
     row = [category, "-", date_str, "-", amount, memo]
     hist_sheet.append_row(row)
 
-# --- カード表示: 在庫リスト用 (修正版: textwrapを使用) ---
+# --- カード表示: 在庫リスト用 (完全1行化) ---
 def create_inventory_card_html(row, today):
     p_days = PENALTY_LIMIT_DAYS - (today - row['保有開始日']).days
     days_held = (today - row['保有開始日']).days
@@ -245,48 +312,17 @@ def create_inventory_card_html(row, today):
     else:
         border, text_c, status, bg_c = "#bdbdbd", "#616161", f"🐢 通常 (残{p_days}日)", "#ffffff"
     
-    # textwrap.dedentを使うことで、コード上のインデントは保ちつつ、
-    # 表示時には余計な空白を消して、Markdownのコードブロック誤認を防ぎます。
-    html = textwrap.dedent(f"""
-    <div style="background-color: {bg_c}; border-radius: 8px; border-left: 8px solid {border}; 
-        box-shadow: 0 2px 5px rgba(0,0,0,0.1); padding: 12px; margin-bottom: 12px;">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-            <div style="font-size: 12px; font-weight: bold; color: {text_c};">{status}</div>
-            <div style="font-size: 12px; font-weight: bold; color: #555;">{start_date_str}〜</div>
-        </div>
-        <div style="font-size: 34px; font-weight: 900; color: #212121; line-height: 1.1; letter-spacing: 1px;">
-            {last4}
-        </div>
-        <div style="text-align: right; font-size: 10px; color: #999; font-family: monospace;">
-            {serial}
-        </div>
-    </div>
-    """)
-    return html
+    # 完全1行文字列
+    return f'<div style="background-color: {bg_c}; border-radius: 8px; border-left: 8px solid {border}; box-shadow: 0 2px 5px rgba(0,0,0,0.1); padding: 12px; margin-bottom: 12px;"><div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;"><div style="font-size: 12px; font-weight: bold; color: {text_c};">{status}</div><div style="font-size: 12px; font-weight: bold; color: #555;">{start_date_str}〜</div></div><div style="font-size: 34px; font-weight: 900; color: #212121; line-height: 1.1; letter-spacing: 1px;">{last4}</div><div style="text-align: right; font-size: 10px; color: #999; font-family: monospace;">{serial}</div></div>'
 
-# --- カード表示: 検索用 (修正版: textwrapを使用) ---
+# --- カード表示: 検索用 (完全1行化) ---
 def create_search_card_html(row, today):
     days_held = (today - row['保有開始日']).days
     serial = row['シリアルナンバー']
     start_date_str = row['保有開始日'].strftime('%Y-%m-%d')
     
-    html = textwrap.dedent(f"""
-    <div style="background-color: #ffffff; border-radius: 12px; border: 1px solid #e0e0e0;
-        padding: 15px; margin-bottom: 10px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
-        
-        <div style="font-size: 13px; color: #757575; margin-bottom: 4px;">保管開始日</div>
-        <div style="font-size: 42px; font-weight: 900; color: #212121; line-height: 1.1; letter-spacing: 1px;">{start_date_str}</div>
-        
-        <div style="font-size: 18px; font-weight: bold; color: #424242; margin-top: 8px; background-color: #f5f5f5; display: inline-block; padding: 4px 12px; border-radius: 20px;">
-            経過 {days_held}日目
-        </div>
-
-        <div style="font-size: 12px; color: #bdbdbd; margin-top: 15px; padding-top: 8px; border-top: 1px solid #f0f0f0; font-family: monospace; text-align: right;">
-            SN: {serial}
-        </div>
-    </div>
-    """)
-    return html
+    # 完全1行文字列
+    return f'<div style="background-color: #ffffff; border-radius: 12px; border: 1px solid #e0e0e0; padding: 15px; margin-bottom: 10px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05);"><div style="font-size: 13px; color: #757575; margin-bottom: 4px;">保管開始日</div><div style="font-size: 42px; font-weight: 900; color: #212121; line-height: 1.1; letter-spacing: 1px;">{start_date_str}</div><div style="font-size: 18px; font-weight: bold; color: #424242; margin-top: 8px; background-color: #f5f5f5; display: inline-block; padding: 4px 12px; border-radius: 20px;">経過 {days_held}日目</div><div style="font-size: 12px; color: #bdbdbd; margin-top: 15px; padding-top: 8px; border-top: 1px solid #f0f0f0; font-family: monospace; text-align: right;">SN: {serial}</div></div>'
 
 # --- メイン処理 ---
 def main():
@@ -385,13 +421,17 @@ def main():
                     st.metric("適用単価", f"¥{est_total_price}", f"基準{base_price}+ボ{est_bonus}")
                     if st.button("補充を確定する", type="primary", use_container_width=True, icon=":material/check_circle:"):
                         with st.spinner('処理中...'):
-                            count, applied_bonus = replenish_data_bulk(extracted, selected_zone_name, base_price, week_count, target_date)
+                            count, skipped_dupe = replenish_data_bulk(extracted, selected_zone_name, base_price, week_count, target_date)
                         if count > 0:
                             st.success(f"{count} 件の補充を確定しました")
+                        elif skipped_dupe > 0:
+                            st.warning(f"⚠️ {skipped_dupe} 件は既に本日の履歴にあるためスキップしました")
+                        else: st.error("エラー: 在庫から該当番号が見つかりませんでした")
+                        
+                        if count > 0:
                             import time
                             time.sleep(2)
                             st.rerun()
-                        else: st.error("エラー: 在庫から該当番号が見つかりませんでした")
         st.divider()
         
         col_title, col_slider = st.columns([2, 1])
@@ -562,4 +602,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
