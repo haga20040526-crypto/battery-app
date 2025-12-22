@@ -10,8 +10,6 @@ import textwrap
 # --- 定数・設定 ---
 PENALTY_LIMIT_DAYS = 28
 NEW_SHEET_NAME = 'database' 
-OLD_INV_SHEET = 'sheet1'
-OLD_HIST_SHEET = 'history'
 EXPECTED_HEADERS = ['シリアルナンバー', 'ステータス', '保有開始日', '完了日', 'エリア', '金額', '備考']
 
 # --- エリア定義 ---
@@ -47,57 +45,90 @@ def get_today_jst():
     now = datetime.datetime.now() + datetime.timedelta(hours=9)
     return now.date()
 
-# --- テキスト解析 ---
+# --- スマートテキスト解析 (改善版) ---
 def extract_serials_with_date(text, default_date):
+    """
+    あらゆる形式のテキストから8桁の数字と、それに関連する日付を抽出する
+    """
     results = []
     default_date_str = default_date.strftime('%Y-%m-%d')
-    if "シリアルナンバー" in text:
-        blocks = text.split("シリアルナンバー")
-        for block in blocks:
-            s_match = re.search(r'[:：]?\s*(\d{8})', block)
-            if s_match:
-                serial = s_match.group(1)
-                d_match = re.search(r'(\d{4}[-/]\d{2}[-/]\d{2})', block)
-                if d_match:
-                    d_str = d_match.group(1).replace('/', '-')
-                    results.append((serial, d_str))
-                else:
-                    results.append((serial, default_date_str))
-    else:
-        serials = re.findall(r'\b\d{8}\b', text)
+    
+    # 行ごとに分割して解析
+    lines = text.split('\n')
+    
+    # 一時バッファ
+    current_date = default_date_str
+    
+    # 日付パターン (YYYY-MM-DD, YYYY/MM/DD)
+    date_pattern = re.compile(r'(\d{4})[-/](\d{2})[-/](\d{2})')
+    # シリアルパターン (8桁数字)
+    serial_pattern = re.compile(r'\b(\d{8})\b')
+    
+    # 全文から「シリアル」と「日付」のペアを探す
+    # SpotJobsの形式: "シリアル..." の行と "保有時間..." の行がセットになっていることが多い
+    # あるいはブロックごとに分かれている
+    
+    # ブロック分割アプローチ（空行区切り）
+    blocks = text.split('\n\n')
+    if len(blocks) < 2: # 改行が少ない場合は行ベースで見る
+        blocks = lines
+
+    for block in blocks:
+        # ブロック内の日付を探す
+        d_match = date_pattern.search(block)
+        if d_match:
+            # 正規化した日付文字列
+            block_date = f"{d_match.group(1)}-{d_match.group(2)}-{d_match.group(3)}"
+        else:
+            block_date = default_date_str
+            
+        # ブロック内のシリアルを探す
+        serials = serial_pattern.findall(block)
         for s in serials:
-            results.append((s, default_date_str))
+            results.append((s, block_date))
+            
+    # 重複排除（同じ番号なら、日付が特定できている方を優先したいが、ここでは単純に後勝ち）
     unique_map = {r[0]: r[1] for r in results}
     return list(unique_map.items())
 
 def extract_serials_only(text):
     return list(set(re.findall(r'\b\d{8}\b', text)))
 
-# --- データ取得・ソート ---
+# --- データ取得 ---
 def get_database():
-    """databaseシートから全データを取得しDataFrame化"""
+    """databaseシートから全データを取得"""
     client = get_connection()
     if not client: return pd.DataFrame()
     try:
-        # シート存在確認
         try:
             sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
         except gspread.exceptions.WorksheetNotFound:
-            st.error(f"エラー: スプレッドシートに '{NEW_SHEET_NAME}' という名前のシートが見つかりません。シート名を確認してください。")
-            return pd.DataFrame()
+            # シート作成を試みる
+            try:
+                wb = client.open('battery_db')
+                sheet = wb.add_worksheet(title=NEW_SHEET_NAME, rows=1000, cols=10)
+                sheet.append_row(EXPECTED_HEADERS)
+            except:
+                st.error(f"シート '{NEW_SHEET_NAME}' が見つかりません。作成も失敗しました。")
+                return pd.DataFrame()
 
         data = sheet.get_all_records()
         df = pd.DataFrame(data)
         
+        # データが空、またはヘッダーだけの状態
         if df.empty:
             return pd.DataFrame(columns=EXPECTED_HEADERS)
         
-        # 型変換とクリーニング
+        # 型変換
         df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
-        # ステータスの空白削除
         if 'ステータス' in df.columns:
             df['ステータス'] = df['ステータス'].astype(str).str.strip()
-        
+        else:
+            # ステータス列がない致命的エラーの修復
+            st.warning("データ構造を自動修復しました（ステータス列の追加）")
+            sheet.insert_row(EXPECTED_HEADERS, index=1)
+            return pd.DataFrame(columns=EXPECTED_HEADERS)
+
         df['金額'] = pd.to_numeric(df['金額'], errors='coerce').fillna(0).astype(int)
         
         for col in ['保有開始日', '完了日']:
@@ -106,29 +137,18 @@ def get_database():
             
         return df
     except Exception as e:
-        st.error(f"データベース読み込みエラー: {e}")
+        st.error(f"データ読込エラー: {e}")
         return pd.DataFrame()
 
 def get_active_inventory(df_all):
     """ステータスが「在庫」のものだけ抽出"""
-    if df_all.empty: return df_all
-    if 'ステータス' not in df_all.columns: return pd.DataFrame()
-    
+    if df_all.empty or 'ステータス' not in df_all.columns: return pd.DataFrame()
     df = df_all[df_all['ステータス'] == '在庫'].copy()
-    
-    # カスタムソート: 日付(昇順) > 末尾番号(昇順)
     if not df.empty:
         df['rev_serial'] = df['シリアルナンバー'].apply(lambda x: x[::-1])
         df_sorted = df.sort_values(by=['保有開始日', 'rev_serial'], ascending=[True, True])
-        df_sorted = df_sorted.drop(columns=['rev_serial'])
-        return df_sorted
+        return df_sorted.drop(columns=['rev_serial'])
     return df
-
-def get_history_data(df_all):
-    """ステータスが「在庫」以外のデータを抽出"""
-    if df_all.empty: return df_all
-    if 'ステータス' not in df_all.columns: return pd.DataFrame()
-    return df_all[df_all['ステータス'] != '在庫'].copy()
 
 def get_vol_bonus(count):
     if count >= 150: return 20
@@ -137,492 +157,305 @@ def get_vol_bonus(count):
     elif count >= 20: return 5
     else: return 0
 
-# --- ステータス更新ロジック ---
-def update_status_bulk(target_serials, new_status, complete_date, zone="", price=0, memo=""):
+# --- 書き込み・更新系 ---
+def register_new_inventory(data_list):
+    """
+    新規在庫を追加
+    重複チェック：現在「在庫」ステータスのものとの重複のみ防ぐ。
+    過去データ（補充済）との重複は許可する。
+    """
+    client = get_connection()
+    sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
+    
+    # 現在の在庫を取得して重複チェック
+    all_records = sheet.get_all_records()
+    df = pd.DataFrame(all_records)
+    
+    current_inventory_serials = set()
+    if not df.empty and 'ステータス' in df.columns:
+        # 文字列として比較、空白削除
+        active_df = df[df['ステータス'].astype(str).str.strip() == '在庫']
+        current_inventory_serials = set(active_df['シリアルナンバー'].astype(str).tolist())
+    
+    # ヘッダーチェック
+    headers = sheet.row_values(1)
+    if not headers or headers != EXPECTED_HEADERS:
+        if not headers: sheet.append_row(EXPECTED_HEADERS)
+        else: sheet.insert_row(EXPECTED_HEADERS, index=1)
+
+    rows_to_add = []
+    skipped_count = 0
+    
+    for s, d in data_list:
+        s_str = str(s)
+        # 既に「在庫」にあるならスキップ
+        if s_str in current_inventory_serials:
+            skipped_count += 1
+            continue
+            
+        d_str = d.strftime('%Y-%m-%d') if isinstance(d, (datetime.date, datetime.datetime)) else str(d)
+        # シリアル, ステータス, 保有開始日, 完了日, エリア, 金額, 備考
+        rows_to_add.append([s_str, '在庫', d_str, '', '', '', ''])
+    
+    if rows_to_add:
+        sheet.append_rows(rows_to_add)
+        
+    return len(rows_to_add), skipped_count
+
+def update_status_bulk(target_serials, new_status, complete_date=None, zone="", price=0, memo=""):
+    """ステータス更新"""
     client = get_connection()
     sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
     all_records = sheet.get_all_records()
-    
-    cells_to_update = []
-    updated_count = 0
-    
     headers = sheet.row_values(1)
-    
-    # ヘッダーチェックと自動修復
-    if not headers or headers != EXPECTED_HEADERS:
-        sheet.insert_row(EXPECTED_HEADERS, index=1)
-        headers = EXPECTED_HEADERS
-        # ヘッダーを直した場合はレコード位置がずれるのでリロード推奨だが、
-        # ここではとりあえず続行 (既存データがある場合)
     
     try:
         col_status = headers.index('ステータス') + 1
-        col_end_date = headers.index('完了日') + 1
+        col_end = headers.index('完了日') + 1
         col_zone = headers.index('エリア') + 1
         col_price = headers.index('金額') + 1
         col_memo = headers.index('備考') + 1
-    except ValueError:
-        st.error("シートのヘッダー構造が不正です。")
-        return 0
+    except: return 0
 
+    cells = []
+    updated_count = 0
     target_set = set(str(s) for s in target_serials)
     
-    for i, row in enumerate(all_records):
-        row_num = i + 2
-        s_num = str(row.get('シリアルナンバー', ''))
-        current_status = str(row.get('ステータス', '')).strip()
-        
-        if current_status == '在庫' and s_num in target_set:
-            cells_to_update.append(gspread.Cell(row_num, col_status, new_status))
-            cells_to_update.append(gspread.Cell(row_num, col_end_date, str(complete_date)))
-            cells_to_update.append(gspread.Cell(row_num, col_zone, zone))
-            cells_to_update.append(gspread.Cell(row_num, col_price, price))
-            if memo:
-                cells_to_update.append(gspread.Cell(row_num, col_memo, memo))
-            updated_count += 1
-    
-    if cells_to_update:
-        sheet.update_cells(cells_to_update)
-    return updated_count
+    comp_str = ""
+    if complete_date:
+        comp_str = complete_date.strftime('%Y-%m-%d') if isinstance(complete_date, (datetime.date, datetime.datetime)) else str(complete_date)
 
-def register_new_inventory(data_list):
-    """新規在庫を追加 (ヘッダー自動修復機能付き)"""
-    client = get_connection()
-    sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
-    
-    # 1. ヘッダーチェック
-    existing_headers = sheet.row_values(1)
-    if not existing_headers or existing_headers != EXPECTED_HEADERS:
-        # ヘッダーがない、または間違っている場合は1行目に挿入/上書き
-        if not existing_headers:
-             sheet.append_row(EXPECTED_HEADERS)
-        else:
-             # 既存があるが違う場合、安全のため1行目に挿入してしまう
-             sheet.insert_row(EXPECTED_HEADERS, index=1)
-        st.toast("ℹ️ シートの見出しを自動修復しました")
-
-    # 2. データ追加
-    rows = []
-    for s, d in data_list:
-        # シリアル, ステータス, 保有開始日, 完了日, エリア, 金額, 備考
-        rows.append([str(s), '在庫', str(d), '', '', '', ''])
-    
-    if rows:
-        sheet.append_rows(rows)
-        
-    return len(rows)
-
-def update_dates_bulk(updates_list):
-    client = get_connection()
-    sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
-    all_records = sheet.get_all_records()
-    headers = sheet.row_values(1)
-    
-    # ヘッダーチェック
-    if '保有開始日' not in headers:
-         st.error("ヘッダーに'保有開始日'が見つかりません。")
-         return 0
-         
-    col_start_date = headers.index('保有開始日') + 1
-    
-    cells_to_update = []
-    updates_map = {str(s): d for s, d in updates_list}
-    
     for i, row in enumerate(all_records):
         s = str(row.get('シリアルナンバー', ''))
         st_val = str(row.get('ステータス', '')).strip()
         
-        if st_val == '在庫' and s in updates_map:
-            row_num = i + 2
-            new_d = updates_map[s]
-            cells_to_update.append(gspread.Cell(row_num, col_start_date, str(new_d)))
+        # 「在庫」のものだけ対象
+        if st_val == '在庫' and s in target_set:
+            r = i + 2
+            cells.append(gspread.Cell(r, col_status, new_status))
+            cells.append(gspread.Cell(r, col_end, comp_str))
+            cells.append(gspread.Cell(r, col_zone, zone))
+            cells.append(gspread.Cell(r, col_price, price))
+            if memo: cells.append(gspread.Cell(r, col_memo, memo))
+            updated_count += 1
             
-    if cells_to_update:
-        sheet.update_cells(cells_to_update)
-    return len(cells_to_update)
+    if cells: sheet.update_cells(cells)
+    return updated_count
 
-# --- データ移行ツール ---
-def migrate_old_data():
-    client = get_connection()
-    wb = client.open('battery_db')
-    new_sheet = wb.worksheet(NEW_SHEET_NAME)
-    
-    # ヘッダーチェック
-    if len(new_sheet.get_all_values()) == 0:
-        new_sheet.append_row(EXPECTED_HEADERS)
-    elif len(new_sheet.get_all_values()) > 1:
-        st.error("databaseシートに既にデータがあります。移行は空のシートでのみ可能です。")
-        return
-
-    rows_to_add = []
-    try:
-        inv_sheet = wb.worksheet(OLD_INV_SHEET)
-        inv_data = inv_sheet.get_all_records()
-        for row in inv_data:
-            s = str(row.get('シリアルナンバー', ''))
-            d = row.get('保有開始日', '')
-            if s:
-                rows_to_add.append([s, '在庫', d, '', '', '', '旧データ移行'])
-    except: st.warning("旧在庫シートが見つかりませんでした。")
-
-    try:
-        hist_sheet = wb.worksheet(OLD_HIST_SHEET)
-        hist_data = hist_sheet.get_all_records()
-        for row in hist_data:
-            s = str(row.get('シリアルナンバー', ''))
-            start_d = row.get('保有開始日', '')
-            end_d = row.get('補充日', '')
-            zone = row.get('補充エリア', '')
-            price = row.get('確定報酬額', 0)
-            memo = row.get('備考', '')
-            status = '補充済'
-            if '棚卸' in memo or '不明' in memo:
-                status = '不明'
-            if s:
-                rows_to_add.append([s, status, start_d, end_d, zone, price, memo])
-    except: st.warning("旧履歴シートが見つかりませんでした。")
-        
-    if rows_to_add:
-        chunk_size = 1000
-        for i in range(0, len(rows_to_add), chunk_size):
-            new_sheet.append_rows(rows_to_add[i:i+chunk_size])
-        st.success(f"移行完了: {len(rows_to_add)} 件のデータを移動しました。")
-    else: st.info("移行するデータがありませんでした。")
-
-# --- カード表示 ---
-def create_inventory_card_html(row, today):
+# --- UIパーツ ---
+def create_card(row, today):
     start_date = row['保有開始日']
     if pd.isnull(start_date):
-        start_date_str = "-"
-        days_held = 0
-        p_days = 99
+        s_str, days, p_days = "-", 0, 99
     else:
-        start_date_str = start_date.strftime('%m/%d')
-        days_held = (today - start_date).days
-        p_days = PENALTY_LIMIT_DAYS - days_held
+        s_str = start_date.strftime('%m/%d')
+        days = (today - start_date).days
+        p_days = PENALTY_LIMIT_DAYS - days
     
-    serial = row['シリアルナンバー']
-    last4 = serial[-4:] if len(serial) >= 4 else serial
+    sn = row['シリアルナンバー']
+    last4 = sn[-4:]
     
-    if p_days <= 5: priority = 1
-    elif days_held <= 3: priority = 2
-    else: priority = 3
-
-    if priority == 1:
-        border, text_c, status, bg_c = "#e57373", "#c62828", f"🔥 要返却 (残{p_days}日)", "#fff5f5"
-    elif priority == 2:
-        border, text_c, status, bg_c = "#81c784", "#2e7d32", "💎 Bonus", "#f1f8e9"
-    else:
-        border, text_c, status, bg_c = "#bdbdbd", "#616161", f"🐢 通常 (残{p_days}日)", "#ffffff"
-    
-    return textwrap.dedent(f"""<div style="background-color: {bg_c}; border-radius: 8px; border-left: 8px solid {border}; box-shadow: 0 2px 5px rgba(0,0,0,0.1); padding: 12px; margin-bottom: 12px;"><div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;"><div style="font-size: 12px; font-weight: bold; color: {text_c};">{status}</div><div style="font-size: 12px; font-weight: bold; color: #555;">{start_date_str}〜</div></div><div style="font-size: 34px; font-weight: 900; color: #212121; line-height: 1.1; letter-spacing: 1px;">{last4}</div><div style="text-align: right; font-size: 10px; color: #999; font-family: monospace;">{serial}</div></div>""")
-
-def create_search_card_html(row, today):
-    start_date = row['保有開始日']
-    if pd.isnull(start_date):
-        start_date_str = "-"
-        days_held = 0
-    else:
-        start_date_str = start_date.strftime('%Y-%m-%d')
-        days_held = (today - start_date).days
+    if p_days <= 5: 
+        c, bg, st_t = "#c62828", "#fff5f5", f"🔥 要返却 (残{p_days}日)"
+        bd = "#e57373"
+    elif days <= 3: 
+        c, bg, st_t = "#2e7d32", "#f1f8e9", "💎 Bonus"
+        bd = "#81c784"
+    else: 
+        c, bg, st_t = "#616161", "#ffffff", f"🐢 通常 (残{p_days}日)"
+        bd = "#bdbdbd"
         
-    serial = row['シリアルナンバー']
-    return textwrap.dedent(f"""<div style="background-color: #ffffff; border-radius: 12px; border: 1px solid #e0e0e0; padding: 15px; margin-bottom: 10px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05);"><div style="font-size: 13px; color: #757575; margin-bottom: 4px;">保管開始日</div><div style="font-size: 42px; font-weight: 900; color: #212121; line-height: 1.1; letter-spacing: 1px;">{start_date_str}</div><div style="font-size: 18px; font-weight: bold; color: #424242; margin-top: 8px; background-color: #f5f5f5; display: inline-block; padding: 4px 12px; border-radius: 20px;">経過 {days_held}日目</div><div style="font-size: 12px; color: #bdbdbd; margin-top: 15px; padding-top: 8px; border-top: 1px solid #f0f0f0; font-family: monospace; text-align: right;">SN: {serial}</div></div>""")
+    return textwrap.dedent(f"""
+    <div style="background:{bg}; border-radius:8px; border-left:8px solid {bd}; padding:12px; margin-bottom:10px; box-shadow:0 2px 5px rgba(0,0,0,0.1);">
+        <div style="display:flex; justify-content:space-between; font-weight:bold; font-size:12px; color:{c};">
+            <div>{st_t}</div><div>{s_str}〜</div>
+        </div>
+        <div style="font-size:34px; font-weight:900; color:#212121;">{last4}</div>
+        <div style="text-align:right; font-size:10px; color:#999; font-family:monospace;">{sn}</div>
+    </div>
+    """)
 
-# --- メイン処理 ---
+# --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V2", page_icon="⚡", layout="wide")
-    st.markdown("""<style>.stSlider { padding-top: 1rem; }</style>""", unsafe_allow_html=True)
+    st.set_page_config(page_title="Battery Manager V5", page_icon="⚡", layout="wide")
+    st.markdown("<style>.stSlider{padding-top:1rem;}</style>", unsafe_allow_html=True)
     today = get_today_jst()
 
-    if 'parsed_data' not in st.session_state: st.session_state['parsed_data'] = None
+    # セッション
     if 'stocktake_buffer' not in st.session_state: st.session_state['stocktake_buffer'] = []
+    if 'parsed_data' not in st.session_state: st.session_state['parsed_data'] = None
 
-    with st.sidebar:
-        st.header("⚙️ 管理メニュー")
-        with st.expander("旧データ移行ツール"):
-            st.warning("注意: 'database'シートが空である必要があります。")
-            if st.button("旧データから移行を実行"):
-                with st.spinner("データ移行中..."):
-                    migrate_old_data()
-
-    # データ読み込み
+    # データ読込
     df_all = get_database()
     
-    # 読み込み確認
-    df_inv = get_active_inventory(df_all)
-    df_hist = get_history_data(df_all)
+    # 在庫・履歴
+    if not df_all.empty and 'ステータス' in df_all.columns:
+        df_inv = get_active_inventory(df_all)
+        df_hist = df_all[df_all['ステータス'] != '在庫']
+    else:
+        df_inv = pd.DataFrame()
+        df_hist = pd.DataFrame()
 
-    # デバッグ情報
-    if df_all.empty:
-        st.info("💡 データベースは空です。棚卸し機能から初期データを登録してください。")
-    elif df_inv.empty:
-        st.warning("⚠️ 在庫データが0件です。棚卸し機能から登録してください。")
-
-    # 集計計算
+    # 集計
     week_earnings = 0
     week_count = 0
-    total_earnings = 0
     if not df_hist.empty:
         start_of_week = today - datetime.timedelta(days=today.weekday())
-        weekly_df = df_hist[(df_hist['完了日'] >= start_of_week) & (df_hist['ステータス'] == '補充済')]
-        week_count = len(weekly_df)
-        week_earnings = weekly_df['金額'].sum()
-        total_earnings = df_hist[df_hist['ステータス'] == '補充済']['金額'].sum()
+        w_df = df_hist[(df_hist['完了日'] >= start_of_week) & (df_hist['ステータス'] == '補充済')]
+        week_count = len(w_df)
+        week_earnings = int(w_df['金額'].sum())
+    
+    cur_bonus = get_vol_bonus(week_count)
 
-    current_bonus = get_vol_bonus(week_count)
-
-    # --- タブ ---
-    tab_home, tab_search, tab_inventory, tab_history, tab_stocktake = st.tabs(["🏠 ホーム", "🔍 個別検索", "📦 在庫", "💰 収益", "📝 棚卸し"])
+    # タブ
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🏠 ホーム", "🔍 検索", "📦 在庫", "💰 収益", "📝 棚卸"])
 
     # 1. ホーム
-    with tab_home:
-        st.markdown("### 今週の成果")
+    with tab1:
         c1, c2, c3 = st.columns(3)
         c1.metric("報酬概算", f"¥ {week_earnings:,}")
         c2.metric("補充本数", f"{week_count} 本")
-        if current_bonus < 20:
-            next_target = 20 if week_count < 20 else (50 if week_count < 50 else (100 if week_count < 100 else 150))
-            remain = next_target - week_count
-            c3.metric("現在ボーナス", f"+{current_bonus}円", delta=f"あと{remain}本")
-        else:
-            c3.metric("現在ボーナス", f"+{current_bonus}円", "MAX RANK")
+        c3.metric("現在ボーナス", f"+{cur_bonus}円")
         st.divider()
 
-        st.subheader("ジョブ登録")
-        job_mode = st.radio("作業モード", ["取出 (在庫登録)", "補充 (報酬確定)"], horizontal=True)
-
-        if job_mode == "取出 (在庫登録)":
-            st.caption("SpotJobsアプリのリストをペーストして登録します。")
-            default_date = st.date_input("基準日 (読取不可時)", value=today)
-            input_text = st.text_area("テキスト貼付", height=100, placeholder="ここにペースト...")
-            if st.button("読込 (内容確認)", type="secondary", icon=":material/search:"):
-                if input_text:
-                    parsed = extract_serials_with_date(input_text, default_date)
+        mode = st.radio("モード", ["取出 (登録)", "補充 (確定)"], horizontal=True)
+        
+        if mode == "取出 (登録)":
+            st.caption("SpotJobsアプリのリストをペーストして「読込」→「登録実行」してください。")
+            txt = st.text_area("テキスト貼付", height=100)
+            date_in = st.date_input("基準日 (読取不可時)", value=today)
+            
+            if st.button("読込 (内容確認)", icon=":material/search:"):
+                if txt:
+                    parsed = extract_serials_with_date(txt, date_in)
                     if parsed:
                         st.session_state['parsed_data'] = parsed
-                        st.rerun()
-                    else: st.warning("シリアルナンバーが見つかりませんでした")
+                        st.success(f"{len(parsed)} 件読み込みました")
+                    else:
+                        st.warning("数字が見つかりませんでした")
+            
             if st.session_state['parsed_data']:
-                st.divider()
-                st.markdown("##### 以下の内容で登録しますか？")
-                preview_df = pd.DataFrame(st.session_state['parsed_data'], columns=["シリアルナンバー", "取得日"])
-                st.dataframe(preview_df, hide_index=True, use_container_width=True)
-                
-                col_reg, col_cancel = st.columns([1, 1])
-                with col_reg:
-                    if st.button("登録を実行する", type="primary", use_container_width=True, icon=":material/save:"):
-                        with st.spinner('登録中...'):
-                            added = register_new_inventory(st.session_state['parsed_data'])
-                        st.success(f"✅ {added} 件を登録しました")
-                        st.session_state['parsed_data'] = None
-                        import time
-                        time.sleep(2)
-                        st.rerun()
-                with col_cancel:
-                    if st.button("キャンセル"):
-                        st.session_state['parsed_data'] = None
-                        st.rerun()
-
-        elif job_mode == "補充 (報酬確定)":
-            st.caption("対象の在庫ステータスを「補充済」に更新します。")
-            col_date, col_area = st.columns([1, 1])
-            with col_date: target_date = st.date_input("補充日", value=today)
-            with col_area:
-                default_index = ZONE_OPTIONS.index("D: その他 (船橋など)")
-                selected_zone_name = st.selectbox("エリア選択", ZONE_OPTIONS, index=default_index)
-            input_text = st.text_area("テキスト貼付", height=100, placeholder="ここにペースト...")
-            
-            if input_text:
-                extracted = extract_serials_only(input_text)
-                if extracted:
-                    st.info(f"{len(extracted)} 件を検出しました")
-                    base_price = ZONES[selected_zone_name]
-                    est_bonus = get_vol_bonus(week_count + len(extracted))
-                    est_total_price = base_price + est_bonus
-                    st.metric("適用単価", f"¥{est_total_price}", f"基準{base_price}+ボ{est_bonus}")
-                    
-                    if st.button("補充を確定する", type="primary", use_container_width=True, icon=":material/check_circle:"):
-                        with st.spinner('ステータス更新中...'):
-                            updated_count = update_status_bulk(
-                                extracted, "補充済", target_date, 
-                                zone=selected_zone_name, price=est_total_price
-                            )
-                        if updated_count > 0:
-                            st.success(f"✅ {updated_count} 件の補充を確定しました")
-                            import time
-                            time.sleep(2)
-                            st.rerun()
-                        else:
-                            st.error("エラー: 更新対象が見つかりませんでした（既に補充済か、未登録です）")
-
-        st.divider()
-        col_title, col_slider = st.columns([2, 1])
-        with col_title: st.subheader("ピックアップ推奨")
-        with col_slider: display_count = st.slider("表示数", 1, 20, 7)
-        
-        if not df_inv.empty:
-            df_rec = df_inv.copy()
-            df_rec['days_held'] = df_rec['保有開始日'].apply(lambda x: (today - x).days)
-            df_rec['penalty_left'] = PENALTY_LIMIT_DAYS - df_rec['days_held']
-            def get_rank(r):
-                if r['penalty_left'] <= 5: return 1 
-                elif r['days_held'] <= 3: return 2
-                return 3
-            df_rec['rank'] = df_rec.apply(get_rank, axis=1)
-            df_rec_sorted = df_rec.sort_values(['rank', 'days_held'], ascending=[True, False])
-            
-            top_n = df_rec_sorted.head(display_count)
-            top_n['rev_serial'] = top_n['シリアルナンバー'].apply(lambda x: x[::-1])
-            top_n = top_n.sort_values(by=['保有開始日', 'rev_serial'])
-            
-            if not top_n.empty:
-                for i in range(0, len(top_n), 4):
-                    chunk = top_n.iloc[i:i+4]
-                    cols = st.columns(4)
-                    for idx, (_, row) in enumerate(chunk.iterrows()):
-                        with cols[idx]:
-                            st.markdown(create_inventory_card_html(row, today), unsafe_allow_html=True)
-            else: st.info("表示対象なし")
-
-    # 2. 検索
-    with tab_search:
-        st.markdown("### 🔢 個別バッテリー検索")
-        search_num = st.number_input("シリアルナンバー (下4桁)", min_value=0, value=0, step=1, format="%d")
-        if search_num > 0 and not df_all.empty:
-            search_term = str(int(search_num)) 
-            hits = df_all[df_all['シリアルナンバー'].str.endswith(search_term)]
-            st.divider()
-            if not hits.empty:
-                st.success(f"{len(hits)} 件ヒット")
-                for _, row in hits.iterrows():
-                    st.write(f"ステータス: **{row['ステータス']}**")
-                    st.markdown(create_search_card_html(row, today), unsafe_allow_html=True)
-            else:
-                st.warning("データが見つかりません")
-
-    # 3. 在庫一覧
-    with tab_inventory:
-        st.subheader("📦 在庫詳細")
-        if not df_inv.empty:
-            st.metric("現在の在庫総数", f"{len(df_inv)} 本")
-            
-            with st.expander("🗑️ 在庫から削除 (手動修正)"):
-                del_serial = st.text_input("削除(不明扱いに変更)するシリアル")
-                if st.button("削除実行"):
-                    cnt = update_status_bulk([del_serial], "手動削除", today, memo="手動削除")
-                    if cnt: 
-                        st.success("ステータスを削除に変更しました")
-                        st.rerun()
-            
-            st.divider()
-            df_disp = df_inv.copy()
-            df_disp['保有開始日'] = df_disp['保有開始日'].apply(lambda x: x.strftime('%Y-%m-%d'))
-            st.dataframe(df_disp[['シリアルナンバー', '保有開始日', 'ステータス']], use_container_width=True, hide_index=True)
-        else:
-            st.info("在庫はありません")
-
-    # 4. 収益
-    with tab_history:
-        st.markdown("### 📊 収益レポート")
-        c_m, c_s = st.columns([3, 1])
-        c_m.metric("今週の確定報酬", f"¥ {week_earnings:,}")
-        c_s.metric("全期間積算", f"¥ {total_earnings:,}")
-        
-        st.divider()
-        if not df_hist.empty:
-            df_graph = df_hist[df_hist['ステータス'] == '補充済'].copy()
-            if not df_graph.empty:
-                chart_df = df_graph.groupby('完了日')['金額'].sum().reset_index()
-                chart_df.columns = ['日付', '金額']
-                chart = alt.Chart(chart_df).mark_bar(color='#29b6f6').encode(
-                    x=alt.X('日付:T', axis=alt.Axis(format='%m/%d')),
-                    y='金額:Q',
-                    tooltip=['日付', '金額']
-                ).interactive()
-                st.altair_chart(chart, use_container_width=True)
-
-        st.markdown("#### 履歴一覧")
-        if not df_hist.empty:
-            df_hist_disp = df_hist.sort_values('完了日', ascending=False)
-            st.dataframe(df_hist_disp, use_container_width=True)
-
-    # 5. 棚卸し
-    with tab_stocktake:
-        st.markdown("### 📝 在庫棚卸し")
-        current_buffer = st.session_state['stocktake_buffer']
-        st.info(f"読込済み: {len(current_buffer)} 本")
-        
-        with st.expander("データの追加読込", expanded=True):
-            stock_input = st.text_area("リスト貼り付け (分割可)", height=100)
-            c_add, c_clear = st.columns([1, 1])
-            with c_add:
-                if st.button("リストに追加", type="primary"):
-                    if stock_input:
-                        new_items = extract_serials_with_date(stock_input, today)
-                        st.session_state['stocktake_buffer'].extend(new_items)
-                        unique = {s: d for s, d in st.session_state['stocktake_buffer']}
-                        st.session_state['stocktake_buffer'] = list(unique.items())
-                        st.rerun()
-            with c_clear:
-                if st.button("リセット"):
-                    st.session_state['stocktake_buffer'] = []
+                st.dataframe(pd.DataFrame(st.session_state['parsed_data'], columns=["SN","日付"]), hide_index=True)
+                if st.button("登録実行", type="primary"):
+                    cnt, skip = register_new_inventory(st.session_state['parsed_data'])
+                    msg = f"✅ {cnt}件 を在庫に登録しました"
+                    if skip > 0: msg += f" (※ {skip}件は既に在庫にあるためスキップ)"
+                    st.success(msg)
+                    st.session_state['parsed_data'] = None
+                    import time
+                    time.sleep(1)
                     st.rerun()
 
-        if st.button("照合開始", type="primary", use_container_width=True):
-            if current_buffer: 
-                stock_map = {s: d for s, d in current_buffer}
-                
+        else: # 補充
+            col_d, col_z = st.columns([1,1])
+            date_done = col_d.date_input("補充日", value=today)
+            zone = col_z.selectbox("エリア", ZONE_OPTIONS)
+            txt = st.text_area("補充リスト貼付", height=100)
+            
+            if txt:
+                sns = extract_serials_only(txt)
+                if sns:
+                    price = ZONES[zone] + get_vol_bonus(week_count + len(sns))
+                    st.info(f"{len(sns)}件検出 / 単価 ¥{price}")
+                    if st.button("補充確定", type="primary"):
+                        cnt = update_status_bulk(sns, "補充済", date_done, zone, price)
+                        if cnt > 0:
+                            st.success(f"{cnt}件 更新しました")
+                            import time
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.warning("更新対象が見つかりません（既に補充済か、未登録）")
+
+        st.divider()
+        st.caption("ピックアップ")
+        if not df_inv.empty:
+            cols = st.columns(4)
+            for i, (_, row) in enumerate(df_inv.head(4).iterrows()):
+                cols[i].markdown(create_card(row, today), unsafe_allow_html=True)
+
+    # 2. 検索
+    with tab2:
+        sn_in = st.number_input("SN下4桁", 0, 9999, 0)
+        if sn_in > 0 and not df_all.empty:
+            term = str(sn_in)
+            hits = df_all[df_all['シリアルナンバー'].str.endswith(term)]
+            if not hits.empty:
+                st.success(f"{len(hits)}件 ヒット")
+                for _, row in hits.iterrows():
+                    st.write(f"状態: **{row['ステータス']}** (SN: {row['シリアルナンバー']})")
+            else:
+                st.warning("なし")
+
+    # 3. 在庫 (救済機能)
+    with tab3:
+        st.metric("在庫数", f"{len(df_inv)}")
+        
+        with st.expander("＋ リストから一括登録 (強制)"):
+            st.caption("ここにSpotJobsのリストを貼れば、問答無用で「在庫」として登録します。")
+            force_txt = st.text_area("リスト貼り付け")
+            if st.button("在庫として登録する"):
+                if force_txt:
+                    parsed = extract_serials_with_date(force_txt, today)
+                    cnt, skip = register_new_inventory(parsed)
+                    st.success(f"{cnt}件 登録完了！")
+                    import time
+                    time.sleep(1)
+                    st.rerun()
+
+        st.dataframe(df_inv, use_container_width=True)
+
+    # 4. 収益
+    with tab4:
+        st.metric("今週", f"¥{week_earnings:,}")
+        if not df_hist.empty:
+            df_g = df_hist[df_hist['ステータス']=='補充済']
+            st.dataframe(df_g.sort_values('完了日', ascending=False), use_container_width=True)
+
+    # 5. 棚卸
+    with tab5:
+        cur = st.session_state['stocktake_buffer']
+        st.info(f"読込数: {len(cur)}")
+        
+        txt_stock = st.text_area("リスト追加")
+        if st.button("追加"):
+            if txt_stock:
+                add = extract_serials_with_date(txt_stock, today)
+                st.session_state['stocktake_buffer'].extend(add)
+                uniq = {s:d for s,d in st.session_state['stocktake_buffer']}
+                st.session_state['stocktake_buffer'] = list(uniq.items())
+                st.rerun()
+        
+        if st.button("リセット"):
+            st.session_state['stocktake_buffer'] = []
+            st.rerun()
+            
+        st.divider()
+        if st.button("照合開始", type="primary"):
+            if cur:
+                s_map = {s:d for s,d in cur}
                 if not df_inv.empty:
                     db_map = dict(zip(df_inv['シリアルナンバー'], df_inv['保有開始日']))
                 else:
                     db_map = {}
                 
-                def fmt(d): return d.strftime('%Y-%m-%d') if not pd.isnull(d) else ""
+                def fdate(d): return d.strftime('%Y-%m-%d') if pd.notnull(d) else ""
                 
-                missing_in_db = []
-                missing_in_hand = []
-                date_mismatch = []
+                missing_db = []
+                for s, d in s_map.items():
+                    # 既に在庫にあればスキップ
+                    if s not in db_map: missing_db.append((s, d))
                 
-                for s, d in stock_map.items():
-                    if s not in db_map:
-                        missing_in_db.append((s, d))
-                    else:
-                        if fmt(db_map[s]) != d:
-                            date_mismatch.append((s, d, fmt(db_map[s])))
-                
-                for s in db_map.keys():
-                    if s not in stock_map:
-                        missing_in_hand.append(s)
-                
-                if not any([missing_in_db, missing_in_hand, date_mismatch]):
-                    st.success("🎉 ズレはありません！")
+                if missing_db:
+                    st.warning(f"未登録: {len(missing_db)}件")
+                    if st.button("一括登録"):
+                        register_new_inventory(missing_db)
+                        st.success("登録完了")
+                        st.rerun()
                 else:
-                    if missing_in_db:
-                        st.warning(f"🚨 未登録: {len(missing_in_db)} 件")
-                        if st.button("一括登録する"):
-                            cnt = register_new_inventory(missing_in_db)
-                            st.success(f"{cnt}件 登録しました")
-                            st.rerun()
-                    
-                    if missing_in_hand:
-                        st.error(f"⚠️ 手元なし: {len(missing_in_hand)} 件")
-                        with st.expander("詳細"):
-                            st.write(", ".join(missing_in_hand))
-                            if st.button("棚卸削除 (ステータス更新)"):
-                                cnt = update_status_bulk(missing_in_hand, "不明", today, memo="棚卸削除")
-                                st.success(f"{cnt}件 削除済にしました")
-                                st.rerun()
-                    
-                    if date_mismatch:
-                        st.info(f"📅 日付ズレ: {len(date_mismatch)} 件")
-                        if st.button("日付を更新"):
-                            updates = [(i[0], i[1]) for i in date_mismatch]
-                            cnt = update_dates_bulk(updates)
-                            st.success(f"{cnt}件 更新しました")
-                            st.rerun()
+                    st.success("すべて登録済みです")
             else:
-                st.warning("リストが入力されていません。")
+                st.warning("リストを入力してください")
 
 if __name__ == '__main__':
     main()
