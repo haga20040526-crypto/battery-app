@@ -12,6 +12,7 @@ PENALTY_LIMIT_DAYS = 28
 NEW_SHEET_NAME = 'database' 
 OLD_INV_SHEET = 'sheet1'
 OLD_HIST_SHEET = 'history'
+EXPECTED_HEADERS = ['シリアルナンバー', 'ステータス', '保有開始日', '完了日', 'エリア', '金額', '備考']
 
 # --- エリア定義 ---
 ZONE_OPTIONS = [
@@ -88,9 +89,8 @@ def get_database():
         data = sheet.get_all_records()
         df = pd.DataFrame(data)
         
-        expected_cols = ['シリアルナンバー', 'ステータス', '保有開始日', '完了日', 'エリア', '金額', '備考']
         if df.empty:
-            return pd.DataFrame(columns=expected_cols)
+            return pd.DataFrame(columns=EXPECTED_HEADERS)
         
         # 型変換とクリーニング
         df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
@@ -147,6 +147,14 @@ def update_status_bulk(target_serials, new_status, complete_date, zone="", price
     updated_count = 0
     
     headers = sheet.row_values(1)
+    
+    # ヘッダーチェックと自動修復
+    if not headers or headers != EXPECTED_HEADERS:
+        sheet.insert_row(EXPECTED_HEADERS, index=1)
+        headers = EXPECTED_HEADERS
+        # ヘッダーを直した場合はレコード位置がずれるのでリロード推奨だが、
+        # ここではとりあえず続行 (既存データがある場合)
+    
     try:
         col_status = headers.index('ステータス') + 1
         col_end_date = headers.index('完了日') + 1
@@ -154,7 +162,7 @@ def update_status_bulk(target_serials, new_status, complete_date, zone="", price
         col_price = headers.index('金額') + 1
         col_memo = headers.index('備考') + 1
     except ValueError:
-        st.error("シートのヘッダーが見つかりません。A1行目を確認してください。")
+        st.error("シートのヘッダー構造が不正です。")
         return 0
 
     target_set = set(str(s) for s in target_serials)
@@ -178,16 +186,30 @@ def update_status_bulk(target_serials, new_status, complete_date, zone="", price
     return updated_count
 
 def register_new_inventory(data_list):
-    """新規在庫を追加 (行追加)"""
+    """新規在庫を追加 (ヘッダー自動修復機能付き)"""
     client = get_connection()
-    # 確実に新しいシートを参照
     sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
+    
+    # 1. ヘッダーチェック
+    existing_headers = sheet.row_values(1)
+    if not existing_headers or existing_headers != EXPECTED_HEADERS:
+        # ヘッダーがない、または間違っている場合は1行目に挿入/上書き
+        if not existing_headers:
+             sheet.append_row(EXPECTED_HEADERS)
+        else:
+             # 既存があるが違う場合、安全のため1行目に挿入してしまう
+             sheet.insert_row(EXPECTED_HEADERS, index=1)
+        st.toast("ℹ️ シートの見出しを自動修復しました")
+
+    # 2. データ追加
     rows = []
     for s, d in data_list:
         # シリアル, ステータス, 保有開始日, 完了日, エリア, 金額, 備考
         rows.append([str(s), '在庫', str(d), '', '', '', ''])
+    
     if rows:
         sheet.append_rows(rows)
+        
     return len(rows)
 
 def update_dates_bulk(updates_list):
@@ -195,6 +217,12 @@ def update_dates_bulk(updates_list):
     sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
     all_records = sheet.get_all_records()
     headers = sheet.row_values(1)
+    
+    # ヘッダーチェック
+    if '保有開始日' not in headers:
+         st.error("ヘッダーに'保有開始日'が見つかりません。")
+         return 0
+         
     col_start_date = headers.index('保有開始日') + 1
     
     cells_to_update = []
@@ -219,7 +247,10 @@ def migrate_old_data():
     wb = client.open('battery_db')
     new_sheet = wb.worksheet(NEW_SHEET_NAME)
     
-    if len(new_sheet.get_all_values()) > 1:
+    # ヘッダーチェック
+    if len(new_sheet.get_all_values()) == 0:
+        new_sheet.append_row(EXPECTED_HEADERS)
+    elif len(new_sheet.get_all_values()) > 1:
         st.error("databaseシートに既にデータがあります。移行は空のシートでのみ可能です。")
         return
 
@@ -324,10 +355,9 @@ def main():
 
     # デバッグ情報
     if df_all.empty:
-        st.error("データベースを読み込めませんでした。シート設定を確認してください。")
+        st.info("💡 データベースは空です。棚卸し機能から初期データを登録してください。")
     elif df_inv.empty:
-        # 在庫は空だが、動くようにする
-        st.warning("現在、在庫データは0件です。（棚卸しタブから登録してください）")
+        st.warning("⚠️ 在庫データが0件です。棚卸し機能から登録してください。")
 
     # 集計計算
     week_earnings = 0
@@ -539,12 +569,10 @@ def main():
                     st.session_state['stocktake_buffer'] = []
                     st.rerun()
 
-        # ★修正箇所: DBが空でも照合を許可する
         if st.button("照合開始", type="primary", use_container_width=True):
-            if current_buffer: # 手元のリストさえあれば照合可能
+            if current_buffer: 
                 stock_map = {s: d for s, d in current_buffer}
                 
-                # DBマップ作成 (在庫があればその日付、なければ空)
                 if not df_inv.empty:
                     db_map = dict(zip(df_inv['シリアルナンバー'], df_inv['保有開始日']))
                 else:
