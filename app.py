@@ -5,6 +5,7 @@ from google.oauth2.service_account import Credentials
 import datetime
 import re
 import altair as alt
+import textwrap
 
 # --- 定数設定 ---
 PENALTY_LIMIT_DAYS = 28
@@ -74,7 +75,6 @@ def extract_serials_only(text):
 # --- カスタムソート: 日付 > 末尾の数字順 ---
 def sort_batteries(df):
     if df.empty: return df
-    # 文字列型にしてから反転
     df['rev_serial'] = df['シリアルナンバー'].astype(str).apply(lambda x: x[::-1])
     df_sorted = df.sort_values(by=['保有開始日', 'rev_serial'], ascending=[True, True])
     df_sorted = df_sorted.drop(columns=['rev_serial'])
@@ -117,6 +117,29 @@ def get_vol_bonus(count):
     elif count >= 20: return 5
     else: return 0
 
+# --- シート書き換え用ヘルパー（JSONエラー対策） ---
+def safe_update_sheet(sheet, df):
+    """DataFrameをシートに安全に書き込む（日付を文字列化）"""
+    if df.empty:
+        sheet.clear()
+        # ヘッダーのみ書き込み
+        sheet.update(range_name='A1', values=[df.columns.values.tolist()])
+        return
+
+    # コピーして処理（元のDFに影響を与えない）
+    df_out = df.copy()
+    
+    # 日付型を文字列に変換 (これがJSONエラー対策の肝)
+    if '保有開始日' in df_out.columns:
+        df_out['保有開始日'] = df_out['保有開始日'].apply(lambda x: x.strftime('%Y-%m-%d') if isinstance(x, (datetime.date, datetime.datetime)) else str(x))
+    
+    # 全データを文字列化して安全性を高める
+    df_out = df_out.astype(str)
+    
+    sheet.clear()
+    update_data = [df_out.columns.values.tolist()] + df_out.values.tolist()
+    sheet.update(range_name=None, values=update_data)
+
 # --- データ操作 ---
 def add_data_bulk_with_dates(data_list):
     client = get_connection()
@@ -141,11 +164,11 @@ def replenish_data_bulk(serials, zone_name, base_price, current_week_count, toda
     db_sheet = client.open(SHEET_NAME).sheet1
     hist_sheet = client.open(SHEET_NAME).worksheet(HISTORY_SHEET_NAME)
     
-    # 全データを取得してDF化
+    # 在庫データの取得
     all_inv = db_sheet.get_all_records()
     df_inv = pd.DataFrame(all_inv)
     
-    # 履歴も取得（重複チェック用）
+    # 履歴データの取得
     all_hist = hist_sheet.get_all_records()
     df_hist = pd.DataFrame(all_hist)
 
@@ -153,11 +176,13 @@ def replenish_data_bulk(serials, zone_name, base_price, current_week_count, toda
     
     # 型統一
     df_inv['シリアルナンバー'] = df_inv['シリアルナンバー'].astype(str)
+    df_inv['保有開始日'] = pd.to_datetime(df_inv['保有開始日'], errors='coerce').dt.date
+
     if not df_hist.empty:
         df_hist['シリアルナンバー'] = df_hist['シリアルナンバー'].astype(str)
         df_hist['補充日'] = pd.to_datetime(df_hist['補充日'], errors='coerce').dt.date
 
-    # 処理対象のシリアル（在庫にあるものだけ）
+    # 処理対象
     target_serials = []
     for s in serials:
         if not df_inv[df_inv['シリアルナンバー'] == str(s)].empty:
@@ -174,7 +199,7 @@ def replenish_data_bulk(serials, zone_name, base_price, current_week_count, toda
     skipped_dupe = 0
 
     for s in target_serials:
-        # 重複チェック: 今日すでに履歴にあればスキップ
+        # 重複チェック
         if not df_hist.empty:
             is_dupe = not df_hist[(df_hist['シリアルナンバー'] == s) & (df_hist['補充日'] == today_date)].empty
             if is_dupe:
@@ -183,32 +208,32 @@ def replenish_data_bulk(serials, zone_name, base_price, current_week_count, toda
 
         # 在庫データ取得
         row_data = df_inv[df_inv['シリアルナンバー'] == s].iloc[0]
-        start_date = pd.to_datetime(row_data['保有開始日']).date()
-        days_held = (today_date - start_date).days
+        start_date = row_data['保有開始日'] # datetime.dateオブジェクト
         
         # 報酬計算
+        if pd.isna(start_date):
+            days_held = 0
+            start_date_str = date_str # 代替
+        else:
+            days_held = (today_date - start_date).days
+            start_date_str = start_date.strftime('%Y-%m-%d')
+
         price = base_price + vol_bonus
         is_early = days_held <= 3
         if is_early: price += 10
         
-        history_rows.append([s, str(start_date), date_str, zone_name, price, "早期ボーナス" if is_early else "-"])
+        history_rows.append([s, start_date_str, date_str, zone_name, price, "早期ボーナス" if is_early else "-"])
 
     # 1. 履歴に追加
     if history_rows:
         hist_sheet.append_rows(history_rows)
     
     # 2. 在庫から削除（書き換え方式）
-    # 処理対象となったシリアルを除外した新しいリストを作る
-    # (重複スキップされたものも、ここに含まれていれば削除する＝「履歴にあるなら在庫には不要」なので)
-    # 安全のため「今回処理対象として見つけたもの」を削除リストとする
+    # 残すべきデータのみを抽出
+    df_new_inv = df_inv[~df_inv['シリアルナンバー'].isin(target_serials)].copy()
     
-    df_new_inv = df_inv[~df_inv['シリアルナンバー'].isin(target_serials)]
-    
-    # シートをクリアして書き直し（これが一番確実）
-    db_sheet.clear()
-    # ヘッダー + データ
-    update_data = [df_new_inv.columns.values.tolist()] + df_new_inv.values.tolist()
-    db_sheet.update(range_name=None, values=update_data)
+    # 安全に書き込み
+    safe_update_sheet(db_sheet, df_new_inv)
         
     return len(history_rows), skipped_dupe
 
@@ -218,26 +243,35 @@ def delete_data_by_serial(serial):
     all_records = sheet.get_all_records()
     df = pd.DataFrame(all_records)
     if df.empty: return False
+    
     df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
     
-    # 該当しないものを残す（書き換え方式）
-    if not df[df['シリアルナンバー'] == str(serial)].empty:
-        df_new = df[df['シリアルナンバー'] != str(serial)]
-        sheet.clear()
-        update_data = [df_new.columns.values.tolist()] + df_new.values.tolist()
-        sheet.update(range_name=None, values=update_data)
-        return True
-    return False
+    # 削除対象が存在するか確認
+    if df[df['シリアルナンバー'] == str(serial)].empty:
+        return False
+
+    # 削除実行（書き換え）
+    df_new = df[df['シリアルナンバー'] != str(serial)].copy()
+    # 日付列のケア（get_all_recordsは文字列でくるが念のため）
+    if '保有開始日' in df_new.columns:
+        df_new['保有開始日'] = pd.to_datetime(df_new['保有開始日'], errors='coerce').dt.date
+
+    safe_update_sheet(sheet, df_new)
+    return True
 
 def archive_missing_items(serials, today_date):
-    """手元にない在庫を削除し、履歴に「棚卸」として保存（書き換え方式）"""
+    """手元にない在庫を削除し、履歴に保存（書き換え方式）"""
     client = get_connection()
     db_sheet = client.open(SHEET_NAME).sheet1
     hist_sheet = client.open(SHEET_NAME).worksheet(HISTORY_SHEET_NAME)
     
     all_records = db_sheet.get_all_records()
     df = pd.DataFrame(all_records)
+    
+    if df.empty: return 0
+
     df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
+    df['保有開始日'] = pd.to_datetime(df['保有開始日'], errors='coerce').dt.date
     
     target_serials = [str(s) for s in serials]
     history_rows = []
@@ -246,17 +280,16 @@ def archive_missing_items(serials, today_date):
     for s in target_serials:
         target = df[df['シリアルナンバー'] == s]
         if not target.empty:
-            start_date = pd.to_datetime(target.iloc[0]['保有開始日']).date()
-            history_rows.append([s, str(start_date), date_str, "棚卸", 0, "棚卸削除(手元なし)"])
+            start_date = target.iloc[0]['保有開始日']
+            start_date_str = start_date.strftime('%Y-%m-%d') if pd.notnull(start_date) else date_str
+            history_rows.append([s, start_date_str, date_str, "棚卸", 0, "棚卸削除(手元なし)"])
 
     if history_rows:
         hist_sheet.append_rows(history_rows)
 
     # 在庫書き換え
-    df_new = df[~df['シリアルナンバー'].isin(target_serials)]
-    db_sheet.clear()
-    update_data = [df_new.columns.values.tolist()] + df_new.values.tolist()
-    db_sheet.update(range_name=None, values=update_data)
+    df_new = df[~df['シリアルナンバー'].isin(target_serials)].copy()
+    safe_update_sheet(db_sheet, df_new)
     
     return len(history_rows)
 
@@ -264,12 +297,10 @@ def update_inventory_dates(updates_list):
     client = get_connection()
     sheet = client.open(SHEET_NAME).sheet1
     all_records = sheet.get_all_records()
-    
-    # 書き換え方式はコストが高いので、ここはCell Updateを使う（行特定ロジック修正）
-    # リストを再取得して行ズレを防ぐ
-    
-    # DFで処理して一括更新の方が安全
     df = pd.DataFrame(all_records)
+    
+    if df.empty: return 0
+
     df['シリアルナンバー'] = df['シリアルナンバー'].astype(str)
     
     update_count = 0
@@ -280,9 +311,9 @@ def update_inventory_dates(updates_list):
             update_count += 1
             
     if update_count > 0:
-        sheet.clear()
-        update_data = [df.columns.values.tolist()] + df.values.tolist()
-        sheet.update(range_name=None, values=update_data)
+        # 日付型にしておく(safe_update_sheetで文字列化される)
+        df['保有開始日'] = pd.to_datetime(df['保有開始日'], errors='coerce').dt.date
+        safe_update_sheet(sheet, df)
         
     return update_count
 
@@ -293,7 +324,7 @@ def add_manual_history(date_obj, amount, memo, category):
     row = [category, "-", date_str, "-", amount, memo]
     hist_sheet.append_row(row)
 
-# --- カード表示: 在庫リスト用 (完全1行化) ---
+# --- カード表示: 在庫リスト用 ---
 def create_inventory_card_html(row, today):
     p_days = PENALTY_LIMIT_DAYS - (today - row['保有開始日']).days
     days_held = (today - row['保有開始日']).days
@@ -312,17 +343,15 @@ def create_inventory_card_html(row, today):
     else:
         border, text_c, status, bg_c = "#bdbdbd", "#616161", f"🐢 通常 (残{p_days}日)", "#ffffff"
     
-    # 完全1行文字列
-    return f'<div style="background-color: {bg_c}; border-radius: 8px; border-left: 8px solid {border}; box-shadow: 0 2px 5px rgba(0,0,0,0.1); padding: 12px; margin-bottom: 12px;"><div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;"><div style="font-size: 12px; font-weight: bold; color: {text_c};">{status}</div><div style="font-size: 12px; font-weight: bold; color: #555;">{start_date_str}〜</div></div><div style="font-size: 34px; font-weight: 900; color: #212121; line-height: 1.1; letter-spacing: 1px;">{last4}</div><div style="text-align: right; font-size: 10px; color: #999; font-family: monospace;">{serial}</div></div>'
+    return textwrap.dedent(f"""<div style="background-color: {bg_c}; border-radius: 8px; border-left: 8px solid {border}; box-shadow: 0 2px 5px rgba(0,0,0,0.1); padding: 12px; margin-bottom: 12px;"><div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;"><div style="font-size: 12px; font-weight: bold; color: {text_c};">{status}</div><div style="font-size: 12px; font-weight: bold; color: #555;">{start_date_str}〜</div></div><div style="font-size: 34px; font-weight: 900; color: #212121; line-height: 1.1; letter-spacing: 1px;">{last4}</div><div style="text-align: right; font-size: 10px; color: #999; font-family: monospace;">{serial}</div></div>""")
 
-# --- カード表示: 検索用 (完全1行化) ---
+# --- カード表示: 検索用 ---
 def create_search_card_html(row, today):
     days_held = (today - row['保有開始日']).days
     serial = row['シリアルナンバー']
     start_date_str = row['保有開始日'].strftime('%Y-%m-%d')
     
-    # 完全1行文字列
-    return f'<div style="background-color: #ffffff; border-radius: 12px; border: 1px solid #e0e0e0; padding: 15px; margin-bottom: 10px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05);"><div style="font-size: 13px; color: #757575; margin-bottom: 4px;">保管開始日</div><div style="font-size: 42px; font-weight: 900; color: #212121; line-height: 1.1; letter-spacing: 1px;">{start_date_str}</div><div style="font-size: 18px; font-weight: bold; color: #424242; margin-top: 8px; background-color: #f5f5f5; display: inline-block; padding: 4px 12px; border-radius: 20px;">経過 {days_held}日目</div><div style="font-size: 12px; color: #bdbdbd; margin-top: 15px; padding-top: 8px; border-top: 1px solid #f0f0f0; font-family: monospace; text-align: right;">SN: {serial}</div></div>'
+    return textwrap.dedent(f"""<div style="background-color: #ffffff; border-radius: 12px; border: 1px solid #e0e0e0; padding: 15px; margin-bottom: 10px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05);"><div style="font-size: 13px; color: #757575; margin-bottom: 4px;">保管開始日</div><div style="font-size: 42px; font-weight: 900; color: #212121; line-height: 1.1; letter-spacing: 1px;">{start_date_str}</div><div style="font-size: 18px; font-weight: bold; color: #424242; margin-top: 8px; background-color: #f5f5f5; display: inline-block; padding: 4px 12px; border-radius: 20px;">経過 {days_held}日目</div><div style="font-size: 12px; color: #bdbdbd; margin-top: 15px; padding-top: 8px; border-top: 1px solid #f0f0f0; font-family: monospace; text-align: right;">SN: {serial}</div></div>""")
 
 # --- メイン処理 ---
 def main():
