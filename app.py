@@ -46,26 +46,17 @@ def get_today_jst():
     now = datetime.datetime.now() + datetime.timedelta(hours=9)
     return now.date()
 
-# --- ★重要: データ浄化フィルター (JSONエラーの根絶) ---
 def sanitize_for_json(val):
-    """
-    Google Sheets APIが嫌う型(numpy.int64, date等)を
-    標準的な int, str に強制変換する
-    """
-    if pd.isna(val):
-        return ""
+    if pd.isna(val): return ""
     if isinstance(val, (datetime.date, datetime.datetime)):
         return val.strftime('%Y-%m-%d')
-    if hasattr(val, 'item'): # numpy types
-        return val.item()
+    if hasattr(val, 'item'): return val.item()
     return str(val)
 
 # --- テキスト解析 ---
 def extract_serials_with_date(text, default_date):
     results = []
     default_date_str = default_date.strftime('%Y-%m-%d')
-    
-    # 全角数字を半角に、余計な空白を削除
     text = text.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
     
     date_pattern = re.compile(r'(\d{4})[-/.](\d{2})[-/.](\d{2})')
@@ -76,11 +67,9 @@ def extract_serials_with_date(text, default_date):
     for i, line in enumerate(lines):
         serials_in_line = serial_pattern.findall(line)
         if not serials_in_line: continue
-            
-        # 前後2行も含めて日付を探す
+        
         search_window = lines[max(0, i-2) : min(len(lines), i+3)]
         found_date = default_date_str
-        
         for check_line in search_window:
             d_match = date_pattern.search(check_line)
             if d_match:
@@ -90,14 +79,12 @@ def extract_serials_with_date(text, default_date):
         for s in serials_in_line:
             results.append((s, found_date))
             
-    # 行単位で見つからなかった場合のバックアップ（全文検索）
     if not results:
         all_serials = serial_pattern.findall(text)
         all_dates = date_pattern.findall(text)
         if all_serials:
             backup_date = f"{all_dates[0][0]}-{all_dates[0][1]}-{all_dates[0][2]}" if all_dates else default_date_str
-            for s in all_serials:
-                results.append((s, backup_date))
+            for s in all_serials: results.append((s, backup_date))
 
     unique_map = {r[0]: r[1] for r in results}
     return list(unique_map.items())
@@ -114,14 +101,9 @@ def get_database():
         try:
             sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
         except:
-            # シート自動作成
-            try:
-                wb = client.open('battery_db')
-                sheet = wb.add_worksheet(title=NEW_SHEET_NAME, rows=1000, cols=10)
-                sheet.append_row(EXPECTED_HEADERS)
-            except:
-                st.error("データベース接続エラー: シートを作成できません。")
-                return pd.DataFrame()
+            wb = client.open('battery_db')
+            sheet = wb.add_worksheet(title=NEW_SHEET_NAME, rows=1000, cols=10)
+            sheet.append_row(EXPECTED_HEADERS)
 
         data = sheet.get_all_records()
         df = pd.DataFrame(data)
@@ -135,9 +117,7 @@ def get_database():
             sheet.insert_row(EXPECTED_HEADERS, index=1)
             return pd.DataFrame(columns=EXPECTED_HEADERS)
 
-        # 金額を安全にint化
         df['金額'] = pd.to_numeric(df['金額'], errors='coerce').fillna(0).astype(int)
-        
         for col in ['保有開始日', '完了日']:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors='coerce').dt.date
@@ -162,15 +142,82 @@ def get_vol_bonus(count):
     elif count >= 20: return 5
     else: return 0
 
-# --- 書き込みロジック (浄化付き) ---
+# --- 書き込み・計算ロジック ---
+
+def recalc_weekly_revenue(sheet, today_date):
+    """
+    今週の全データを再計算し、最新のボーナス単価で金額を上書きする
+    """
+    all_records = sheet.get_all_records()
+    headers = sheet.row_values(1)
+    
+    try:
+        col_price = headers.index('金額') + 1
+    except: return 0
+
+    # 今週の範囲を特定 (月曜〜日曜)
+    start_of_week = today_date - datetime.timedelta(days=today_date.weekday())
+    end_of_week = start_of_week + datetime.timedelta(days=6)
+
+    # 1. 今週の本数をカウント
+    weekly_indices = []
+    
+    for i, row in enumerate(all_records):
+        st_val = str(row.get('ステータス', '')).strip()
+        comp_date_str = str(row.get('完了日', ''))
+        
+        if st_val == '補充済' and comp_date_str:
+            try:
+                comp_date = datetime.datetime.strptime(comp_date_str, '%Y-%m-%d').date()
+                if start_of_week <= comp_date <= end_of_week:
+                    weekly_indices.append(i)
+            except: pass
+
+    week_count = len(weekly_indices)
+    current_bonus = get_vol_bonus(week_count)
+    
+    # 2. 単価を再計算して更新
+    cells_to_update = []
+    updated_count = 0
+    
+    for idx in weekly_indices:
+        row = all_records[idx]
+        
+        # エリア単価
+        zone_name = str(row.get('エリア', ''))
+        base_price = ZONES.get(zone_name, 70) # デフォルト70
+        
+        # 早期ボーナス判定
+        start_d_str = str(row.get('保有開始日', ''))
+        end_d_str = str(row.get('完了日', ''))
+        early_bonus = 0
+        try:
+            s_date = datetime.datetime.strptime(start_d_str, '%Y-%m-%d').date()
+            e_date = datetime.datetime.strptime(end_d_str, '%Y-%m-%d').date()
+            if (e_date - s_date).days <= 3:
+                early_bonus = 10
+        except: pass
+        
+        # 新しい単価
+        new_total_price = base_price + current_bonus + early_bonus
+        
+        # 現在の値と違えば更新リストへ
+        current_recorded_price = row.get('金額', 0)
+        if current_recorded_price != new_total_price:
+            cells_to_update.append(gspread.Cell(idx + 2, col_price, new_total_price))
+            updated_count += 1
+
+    if cells_to_update:
+        sheet.update_cells(cells_to_update)
+        
+    return updated_count
+
 def register_new_inventory(data_list):
-    """新規在庫を追加"""
     client = get_connection()
     sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
-    
-    # 既存チェック
     all_records = sheet.get_all_records()
     df = pd.DataFrame(all_records)
+    
     current_active = set()
     if not df.empty and 'ステータス' in df.columns:
         active_df = df[df['ステータス'].astype(str).str.strip() == '在庫']
@@ -179,34 +226,25 @@ def register_new_inventory(data_list):
     headers = sheet.row_values(1)
     if not headers: sheet.append_row(EXPECTED_HEADERS)
 
-    rows_to_add = []
+    rows = []
     skipped = 0
     for s, d in data_list:
         s_str = str(s)
         if s_str in current_active:
             skipped += 1
             continue
-        
-        # 浄化してリスト化
-        row = [
-            sanitize_for_json(s_str),
-            "在庫",
-            sanitize_for_json(d),
-            "", "", "", ""
-        ]
-        rows_to_add.append(row)
+        row = [sanitize_for_json(s_str), "在庫", sanitize_for_json(d), "", "", "", ""]
+        rows.append(row)
     
-    if rows_to_add:
-        try:
-            sheet.append_rows(rows_to_add)
+    if rows:
+        try: sheet.append_rows(rows)
         except Exception as e:
             st.error(f"保存エラー: {e}")
             return 0, 0
-            
-    return len(rows_to_add), skipped
+    return len(rows), skipped
 
 def update_status_bulk(target_serials, new_status, complete_date=None, zone="", price=0, memo=""):
-    """ステータス更新"""
+    """ステータス更新 + 週次ボーナス再計算"""
     client = get_connection()
     sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
     all_records = sheet.get_all_records()
@@ -224,9 +262,9 @@ def update_status_bulk(target_serials, new_status, complete_date=None, zone="", 
     updated = 0
     target_set = set(str(s) for s in target_serials)
     
-    # 浄化
     comp_str = sanitize_for_json(complete_date)
-    safe_price = int(price) # numpy int排除
+    # ここでのpriceは暫定値。直後にrecalc_weekly_revenueで上書きされる
+    safe_price = int(price)
 
     for i, row in enumerate(all_records):
         s = str(row.get('シリアルナンバー', ''))
@@ -241,15 +279,18 @@ def update_status_bulk(target_serials, new_status, complete_date=None, zone="", 
             updated += 1
             
     if cells:
-        try:
-            sheet.update_cells(cells)
+        try: sheet.update_cells(cells)
         except Exception as e:
             st.error(f"更新エラー: {e}")
             return 0
+            
+    # ★ここで今週分の金額を再計算して一斉更新
+    if updated > 0 and new_status == '補充済' and complete_date:
+        recalc_weekly_revenue(sheet, complete_date)
+
     return updated
 
 def update_dates_bulk(updates_list):
-    """日付更新"""
     client = get_connection()
     sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
     all_records = sheet.get_all_records()
@@ -258,7 +299,6 @@ def update_dates_bulk(updates_list):
     col_start = headers.index('保有開始日') + 1
     
     cells = []
-    # 辞書化の際に型を浄化
     updates_map = {str(s): sanitize_for_json(d) for s, d in updates_list}
     
     for i, row in enumerate(all_records):
@@ -269,14 +309,11 @@ def update_dates_bulk(updates_list):
             cells.append(gspread.Cell(r, col_start, updates_map[s]))
             
     if cells:
-        try:
-            sheet.update_cells(cells)
-        except Exception as e:
-            st.error(f"日付更新エラー: {e}")
-            return 0
+        try: sheet.update_cells(cells)
+        except: return 0
     return len(cells)
 
-# --- UI ---
+# --- UIパーツ ---
 def create_card(row, today):
     start_date = row['保有開始日']
     if pd.isnull(start_date):
@@ -308,7 +345,7 @@ def create_card(row, today):
 
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V9", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V10", page_icon="⚡", layout="wide")
     st.markdown("<style>.stSlider{padding-top:1rem;}</style>", unsafe_allow_html=True)
     today = get_today_jst()
 
@@ -335,14 +372,14 @@ def main():
         c1, c2, c3 = st.columns(3)
         c1.metric("報酬", f"¥ {week_earnings:,}")
         c2.metric("本数", f"{week_count} 本")
-        c3.metric("現在ボナ", f"+{cur_bonus}円")
+        c3.metric("現在ボナ", f"+{cur_bonus}円/本")
         st.divider()
 
         mode = st.radio("モード", ["取出 (登録)", "補充 (確定)"], horizontal=True)
         
         if mode == "取出 (登録)":
             txt = st.text_area("SpotJobsリスト貼付", height=100)
-            date_in = st.date_input("基準日 (読取不可時)", value=today)
+            date_in = st.date_input("基準日", value=today)
             if st.button("読込", icon=":material/search:"):
                 if txt:
                     parsed = extract_serials_with_date(txt, date_in)
@@ -359,8 +396,7 @@ def main():
                         import time
                         time.sleep(1)
                         st.rerun()
-                    else:
-                        st.warning("登録なし (すべて重複)")
+                    else: st.warning("登録なし (すべて重複)")
 
         else: 
             col_d, col_z = st.columns([1,1])
@@ -370,11 +406,15 @@ def main():
             if txt:
                 sns = extract_serials_only(txt)
                 if sns:
-                    price = ZONES[zone] + get_vol_bonus(week_count + len(sns))
-                    st.info(f"{len(sns)}件 / 単価 ¥{price}")
-                    if st.button("補充確定", type="primary"):
-                        cnt = update_status_bulk(sns, "補充済", date_done, zone, price)
-                        st.success(f"{cnt}件 更新しました")
+                    # 予測表示 (ここでの表示は参考値、確定時に全件再計算される)
+                    base = ZONES[zone]
+                    new_count = week_count + len(sns)
+                    new_bonus = get_vol_bonus(new_count)
+                    st.info(f"{len(sns)}件検出 / 確定後の全件ボーナス: +{new_bonus}円 (総数{new_count}本)")
+                    
+                    if st.button("補充確定 (遡及計算)", type="primary"):
+                        cnt = update_status_bulk(sns, "補充済", date_done, zone, base)
+                        st.success(f"{cnt}件 更新 & 今週分の単価を再計算しました")
                         import time
                         time.sleep(1)
                         st.rerun()
@@ -434,7 +474,7 @@ def main():
         st.divider()
         c_act1, c_act2 = st.columns(2)
         with c_act1:
-            if st.button("照合＆登録・更新 (推奨)", type="primary", use_container_width=True):
+            if st.button("照合＆登録・更新", type="primary", use_container_width=True):
                 if cur:
                     s_map = {s:d for s,d in cur}
                     db_map = {}
@@ -466,7 +506,7 @@ def main():
                 else: st.warning("リストなし")
 
         with c_act2:
-            if st.button("強制全件登録 (救済用)", use_container_width=True):
+            if st.button("強制全件登録 (救済)", use_container_width=True):
                 if cur:
                     cnt, skip = register_new_inventory(cur)
                     st.success(f"{cnt}件 強制登録")
