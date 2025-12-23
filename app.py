@@ -145,9 +145,6 @@ def get_vol_bonus(count):
 # --- 書き込み・計算ロジック ---
 
 def recalc_weekly_revenue(sheet, today_date):
-    """
-    今週の全データを再計算し、最新のボーナス単価で金額を上書きする
-    """
     all_records = sheet.get_all_records()
     headers = sheet.row_values(1)
     
@@ -155,11 +152,9 @@ def recalc_weekly_revenue(sheet, today_date):
         col_price = headers.index('金額') + 1
     except: return 0
 
-    # 今週の範囲を特定 (月曜〜日曜)
     start_of_week = today_date - datetime.timedelta(days=today_date.weekday())
     end_of_week = start_of_week + datetime.timedelta(days=6)
 
-    # 1. 今週の本数をカウント
     weekly_indices = []
     
     for i, row in enumerate(all_records):
@@ -176,18 +171,14 @@ def recalc_weekly_revenue(sheet, today_date):
     week_count = len(weekly_indices)
     current_bonus = get_vol_bonus(week_count)
     
-    # 2. 単価を再計算して更新
     cells_to_update = []
     updated_count = 0
     
     for idx in weekly_indices:
         row = all_records[idx]
-        
-        # エリア単価
         zone_name = str(row.get('エリア', ''))
-        base_price = ZONES.get(zone_name, 70) # デフォルト70
+        base_price = ZONES.get(zone_name, 70)
         
-        # 早期ボーナス判定
         start_d_str = str(row.get('保有開始日', ''))
         end_d_str = str(row.get('完了日', ''))
         early_bonus = 0
@@ -198,10 +189,8 @@ def recalc_weekly_revenue(sheet, today_date):
                 early_bonus = 10
         except: pass
         
-        # 新しい単価
         new_total_price = base_price + current_bonus + early_bonus
         
-        # 現在の値と違えば更新リストへ
         current_recorded_price = row.get('金額', 0)
         if current_recorded_price != new_total_price:
             cells_to_update.append(gspread.Cell(idx + 2, col_price, new_total_price))
@@ -244,7 +233,6 @@ def register_new_inventory(data_list):
     return len(rows), skipped
 
 def update_status_bulk(target_serials, new_status, complete_date=None, zone="", price=0, memo=""):
-    """ステータス更新 + 週次ボーナス再計算"""
     client = get_connection()
     sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
     all_records = sheet.get_all_records()
@@ -263,7 +251,6 @@ def update_status_bulk(target_serials, new_status, complete_date=None, zone="", 
     target_set = set(str(s) for s in target_serials)
     
     comp_str = sanitize_for_json(complete_date)
-    # ここでのpriceは暫定値。直後にrecalc_weekly_revenueで上書きされる
     safe_price = int(price)
 
     for i, row in enumerate(all_records):
@@ -284,7 +271,6 @@ def update_status_bulk(target_serials, new_status, complete_date=None, zone="", 
             st.error(f"更新エラー: {e}")
             return 0
             
-    # ★ここで今週分の金額を再計算して一斉更新
     if updated > 0 and new_status == '補充済' and complete_date:
         recalc_weekly_revenue(sheet, complete_date)
 
@@ -313,39 +299,49 @@ def update_dates_bulk(updates_list):
         except: return 0
     return len(cells)
 
-# --- UIパーツ ---
+# --- UIパーツ (ステータス対応カード) ---
 def create_card(row, today):
-    start_date = row['保有開始日']
-    if pd.isnull(start_date):
-        s_str, days, p_days = "-", 0, 99
-    else:
-        s_str = start_date.strftime('%m/%d')
-        days = (today - start_date).days
-        p_days = PENALTY_LIMIT_DAYS - days
-    
+    start_date = row.get('保有開始日')
+    status = str(row.get('ステータス', '')).strip()
     sn = row['シリアルナンバー']
     last4 = sn[-4:]
     
-    if p_days <= 5: 
-        c, bg, st_t, bd = "#c62828", "#fff5f5", f"🔥 要返却 (残{p_days}日)", "#e57373"
-    elif days <= 3: 
-        c, bg, st_t, bd = "#2e7d32", "#f1f8e9", "💎 Bonus", "#81c784"
-    else: 
-        c, bg, st_t, bd = "#616161", "#ffffff", f"🐢 通常 (残{p_days}日)", "#bdbdbd"
-        
+    if pd.isnull(start_date):
+        s_str, days = "-", 0
+    else:
+        s_str = start_date.strftime('%m/%d')
+        days = (today - start_date).days
+    
+    # ステータス別デザイン
+    if status == '補充済':
+        c, bg, st_t, bd = "#1565c0", "#e3f2fd", f"✅ 補充済 ({s_str}〜)", "#2196f3"
+        main_text = f"完了"
+    elif status == '不明' or '削除' in status:
+        c, bg, st_t, bd = "#616161", "#eeeeee", "🚫 不明/削除", "#9e9e9e"
+        main_text = "Missing"
+    else:
+        # 在庫の場合
+        p_days = PENALTY_LIMIT_DAYS - days
+        if p_days <= 5: 
+            c, bg, st_t, bd = "#c62828", "#fff5f5", f"🔥 要返却 (残{p_days}日)", "#e57373"
+        elif days <= 3: 
+            c, bg, st_t, bd = "#2e7d32", "#f1f8e9", "💎 Bonus", "#81c784"
+        else: 
+            c, bg, st_t, bd = "#616161", "#ffffff", f"🐢 通常 (残{p_days}日)", "#bdbdbd"
+        main_text = last4
+
     return textwrap.dedent(f"""
     <div style="background:{bg}; border-radius:8px; border-left:8px solid {bd}; padding:12px; margin-bottom:10px; box-shadow:0 2px 5px rgba(0,0,0,0.1);">
         <div style="display:flex; justify-content:space-between; font-weight:bold; font-size:12px; color:{c};">
-            <div>{st_t}</div><div>{s_str}〜</div>
+            <div>{st_t}</div><div>SN: {sn}</div>
         </div>
-        <div style="font-size:34px; font-weight:900; color:#212121;">{last4}</div>
-        <div style="text-align:right; font-size:10px; color:#999; font-family:monospace;">{sn}</div>
+        <div style="font-size:34px; font-weight:900; color:#212121; margin-top:4px;">{main_text}</div>
     </div>
     """)
 
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V10", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V11", page_icon="⚡", layout="wide")
     st.markdown("<style>.stSlider{padding-top:1rem;}</style>", unsafe_allow_html=True)
     today = get_today_jst()
 
@@ -379,7 +375,7 @@ def main():
         
         if mode == "取出 (登録)":
             txt = st.text_area("SpotJobsリスト貼付", height=100)
-            date_in = st.date_input("基準日", value=today)
+            date_in = st.date_input("基準日 (読取不可時)", value=today)
             if st.button("読込", icon=":material/search:"):
                 if txt:
                     parsed = extract_serials_with_date(txt, date_in)
@@ -406,15 +402,13 @@ def main():
             if txt:
                 sns = extract_serials_only(txt)
                 if sns:
-                    # 予測表示 (ここでの表示は参考値、確定時に全件再計算される)
                     base = ZONES[zone]
                     new_count = week_count + len(sns)
                     new_bonus = get_vol_bonus(new_count)
-                    st.info(f"{len(sns)}件検出 / 確定後の全件ボーナス: +{new_bonus}円 (総数{new_count}本)")
-                    
+                    st.info(f"{len(sns)}件検出 / 確定後ボナ: +{new_bonus}円 (総数{new_count}本)")
                     if st.button("補充確定 (遡及計算)", type="primary"):
                         cnt = update_status_bulk(sns, "補充済", date_done, zone, base)
-                        st.success(f"{cnt}件 更新 & 今週分の単価を再計算しました")
+                        st.success(f"{cnt}件 更新 & 再計算完了")
                         import time
                         time.sleep(1)
                         st.rerun()
@@ -425,7 +419,7 @@ def main():
             for i, (_, row) in enumerate(df_inv.head(4).iterrows()):
                 cols[i].markdown(create_card(row, today), unsafe_allow_html=True)
 
-    # 2. 検索
+    # 2. 検索 (カード表示対応)
     with tab2:
         sn_in = st.number_input("SN下4桁", 0, 9999, 0)
         if sn_in > 0 and not df_all.empty:
@@ -433,7 +427,7 @@ def main():
             if not hits.empty:
                 st.success(f"{len(hits)}件 ヒット")
                 for _, row in hits.iterrows():
-                    st.info(f"状態: {row['ステータス']} / 開始: {row['保有開始日']} / 完了: {row['完了日']}")
+                    st.markdown(create_card(row, today), unsafe_allow_html=True)
             else: st.warning("なし")
 
     # 3. 在庫
