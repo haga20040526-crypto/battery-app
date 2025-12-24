@@ -53,42 +53,33 @@ def sanitize_for_json(val):
     if hasattr(val, 'item'): return val.item()
     return str(val)
 
-# --- テキスト解析 (V14: 後方検索のみに限定) ---
+# --- テキスト解析 ---
 def extract_serials_with_date(text, default_date):
     results = []
     default_date_str = default_date.strftime('%Y-%m-%d')
-    # 全角数字を半角に
     text = text.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
     
     date_pattern = re.compile(r'(\d{4})[-/.](\d{2})[-/.](\d{2})')
     serial_pattern = re.compile(r'\b(\d{8})\b')
 
-    # 空行を除去してリスト化
     lines = [line.strip() for line in text.split('\n') if line.strip()]
     
     for i, line in enumerate(lines):
-        # まずこの行にシリアルがあるか確認
         serials_in_line = serial_pattern.findall(line)
-        if not serials_in_line:
-            continue
-            
-        # シリアルがあった場合、日付を探す
-        # ★修正点: 「現在行(i) から 後ろ(i+3) まで」のみを探す。
-        # i-1 (前の行) は絶対に見ない。
+        if not serials_in_line: continue
+        
+        # 同じ行〜下3行を探す
         search_window = lines[i : min(len(lines), i+4)]
-        
-        found_date = default_date_str # 見つからなければデフォルト（今日）
-        
+        found_date = default_date_str
         for check_line in search_window:
             d_match = date_pattern.search(check_line)
             if d_match:
                 found_date = f"{d_match.group(1)}-{d_match.group(2)}-{d_match.group(3)}"
-                break # 最初に見つかった日付（最も近い後ろの日付）を採用
+                break
         
         for s in serials_in_line:
             results.append((s, found_date))
             
-    # 全文検索バックアップ (行単位で見つからなかった場合の保険)
     if not results:
         all_serials = serial_pattern.findall(text)
         all_dates = date_pattern.findall(text)
@@ -96,7 +87,6 @@ def extract_serials_with_date(text, default_date):
             backup_date = f"{all_dates[0][0]}-{all_dates[0][1]}-{all_dates[0][2]}" if all_dates else default_date_str
             for s in all_serials: results.append((s, backup_date))
 
-    # 重複排除 (後勝ち)
     unique_map = {r[0]: r[1] for r in results}
     return list(unique_map.items())
 
@@ -142,7 +132,6 @@ def get_active_inventory(df_all):
     df = df_all[df_all['ステータス'] == '在庫'].copy()
     if not df.empty:
         df['rev_serial'] = df['シリアルナンバー'].apply(lambda x: x[::-1])
-        # 日付順 > 末尾順
         df_sorted = df.sort_values(by=['保有開始日', 'rev_serial'], ascending=[True, True])
         return df_sorted.drop(columns=['rev_serial'])
     return df
@@ -294,7 +283,7 @@ def update_dates_bulk(updates_list):
         except: return 0
     return len(cells)
 
-# --- UIパーツ (V13仕様: 取得日メイン) ---
+# --- UIパーツ ---
 def create_card(row, today):
     start_date = row.get('保有開始日')
     status = str(row.get('ステータス', '')).strip()
@@ -339,7 +328,7 @@ def create_card(row, today):
 
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V14", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V15", page_icon="⚡", layout="wide")
     st.markdown("<style>.stSlider{padding-top:1rem;}</style>", unsafe_allow_html=True)
     today = get_today_jst()
 
@@ -412,7 +401,6 @@ def main():
                         st.rerun()
 
         st.divider()
-        
         st.markdown("##### 📌 ピックアップ")
         col_sl, _ = st.columns([1,2])
         with col_sl:
@@ -453,12 +441,45 @@ def main():
         st.metric("在庫数", f"{len(df_inv)}")
         st.dataframe(df_inv, use_container_width=True)
 
-    # 4. 収益
+    # 4. 収益 (週次比較機能追加)
     with tab4:
         st.metric("今週", f"¥{week_earnings:,}")
+        
+        # 週ごとの比較グラフ
         if not df_hist.empty:
-            df_g = df_hist[df_hist['ステータス']=='補充済']
-            st.dataframe(df_g.sort_values('完了日', ascending=False), use_container_width=True)
+            df_wk = df_hist[df_hist['ステータス'] == '補充済'].copy()
+            if not df_wk.empty:
+                # 完了日をTimestamp型に変換して処理
+                df_wk['date'] = pd.to_datetime(df_wk['完了日'])
+                # 月曜始まりの週に丸める
+                df_wk['week_start'] = df_wk['date'].apply(lambda x: x - datetime.timedelta(days=x.weekday()))
+                
+                # 集計
+                weekly_agg = df_wk.groupby('week_start').agg(
+                    total_amount=('金額', 'sum'),
+                    count=('金額', 'count')
+                ).reset_index().sort_values('week_start')
+                
+                # 表示用ラベル (YYYY/MM/DD)
+                weekly_agg['Label'] = weekly_agg['week_start'].dt.strftime('%Y/%m/%d') + " 週"
+
+                st.divider()
+                st.subheader("📈 週次比較 (月〜日)")
+                
+                chart = alt.Chart(weekly_agg).mark_bar().encode(
+                    x=alt.X('Label', sort=None, title='週 (月曜開始)'),
+                    y=alt.Y('total_amount', title='合計金額 (円)'),
+                    tooltip=['Label', alt.Tooltip('total_amount', format=','), alt.Tooltip('count', title='本数')]
+                ).properties(height=300)
+                
+                st.altair_chart(chart, use_container_width=True)
+                
+                with st.expander("詳細データを見る"):
+                    st.dataframe(weekly_agg[['Label', 'total_amount', 'count']], hide_index=True, use_container_width=True)
+
+            st.divider()
+            st.markdown("##### 📝 履歴全リスト")
+            st.dataframe(df_hist.sort_values('完了日', ascending=False), use_container_width=True)
 
     # 5. 棚卸
     with tab5:
