@@ -53,32 +53,42 @@ def sanitize_for_json(val):
     if hasattr(val, 'item'): return val.item()
     return str(val)
 
-# --- テキスト解析 ---
+# --- テキスト解析 (V14: 後方検索のみに限定) ---
 def extract_serials_with_date(text, default_date):
     results = []
     default_date_str = default_date.strftime('%Y-%m-%d')
+    # 全角数字を半角に
     text = text.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
     
     date_pattern = re.compile(r'(\d{4})[-/.](\d{2})[-/.](\d{2})')
     serial_pattern = re.compile(r'\b(\d{8})\b')
 
+    # 空行を除去してリスト化
     lines = [line.strip() for line in text.split('\n') if line.strip()]
     
     for i, line in enumerate(lines):
+        # まずこの行にシリアルがあるか確認
         serials_in_line = serial_pattern.findall(line)
-        if not serials_in_line: continue
+        if not serials_in_line:
+            continue
+            
+        # シリアルがあった場合、日付を探す
+        # ★修正点: 「現在行(i) から 後ろ(i+3) まで」のみを探す。
+        # i-1 (前の行) は絶対に見ない。
+        search_window = lines[i : min(len(lines), i+4)]
         
-        search_window = lines[max(0, i-2) : min(len(lines), i+3)]
-        found_date = default_date_str
+        found_date = default_date_str # 見つからなければデフォルト（今日）
+        
         for check_line in search_window:
             d_match = date_pattern.search(check_line)
             if d_match:
                 found_date = f"{d_match.group(1)}-{d_match.group(2)}-{d_match.group(3)}"
-                break
+                break # 最初に見つかった日付（最も近い後ろの日付）を採用
         
         for s in serials_in_line:
             results.append((s, found_date))
             
+    # 全文検索バックアップ (行単位で見つからなかった場合の保険)
     if not results:
         all_serials = serial_pattern.findall(text)
         all_dates = date_pattern.findall(text)
@@ -86,6 +96,7 @@ def extract_serials_with_date(text, default_date):
             backup_date = f"{all_dates[0][0]}-{all_dates[0][1]}-{all_dates[0][2]}" if all_dates else default_date_str
             for s in all_serials: results.append((s, backup_date))
 
+    # 重複排除 (後勝ち)
     unique_map = {r[0]: r[1] for r in results}
     return list(unique_map.items())
 
@@ -283,7 +294,7 @@ def update_dates_bulk(updates_list):
         except: return 0
     return len(cells)
 
-# --- UIパーツ (V13: 取得日メイン) ---
+# --- UIパーツ (V13仕様: 取得日メイン) ---
 def create_card(row, today):
     start_date = row.get('保有開始日')
     status = str(row.get('ステータス', '')).strip()
@@ -305,7 +316,6 @@ def create_card(row, today):
         date_label = "-"
         main_text = "Missing"
     else:
-        # 在庫 (色はペナルティ基準だが、テキストは日付)
         p_days = PENALTY_LIMIT_DAYS - days
         if p_days <= 5: 
             c, bg, st_t, bd = "#c62828", "#fff5f5", "🔥 要返却", "#e57373"
@@ -314,7 +324,7 @@ def create_card(row, today):
         else: 
             c, bg, st_t, bd = "#616161", "#ffffff", "🐢 通常", "#bdbdbd"
         
-        date_label = f"取得: {s_str}" # ここを変更
+        date_label = f"取得: {s_str}"
         main_text = last4
 
     return textwrap.dedent(f"""
@@ -329,7 +339,7 @@ def create_card(row, today):
 
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V13", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V14", page_icon="⚡", layout="wide")
     st.markdown("<style>.stSlider{padding-top:1rem;}</style>", unsafe_allow_html=True)
     today = get_today_jst()
 
@@ -403,7 +413,6 @@ def main():
 
         st.divider()
         
-        # ピックアップ (取得日順)
         st.markdown("##### 📌 ピックアップ")
         col_sl, _ = st.columns([1,2])
         with col_sl:
@@ -411,14 +420,12 @@ def main():
 
         if not df_inv.empty:
             df_disp = df_inv.copy()
-            # 優先度: 1.危険(期限近), 2.ボーナス(取得3日以内), 3.通常
             def get_priority(row):
                 days = (today - row['保有開始日']).days
                 if days >= (PENALTY_LIMIT_DAYS - 5): return 1
                 if days <= 3: return 2
                 return 3
             df_disp['rank'] = df_disp.apply(get_priority, axis=1)
-            # ソート: 優先度 > 日付(古い順)
             df_disp = df_disp.sort_values(by=['rank', '保有開始日'], ascending=[True, True])
             
             top_n = df_disp.head(disp_count)
