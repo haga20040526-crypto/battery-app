@@ -6,7 +6,7 @@ import datetime
 import re
 import altair as alt
 import textwrap
-import json
+import uuid
 
 # --- 定数・設定 ---
 PENALTY_LIMIT_DAYS = 28
@@ -68,7 +68,6 @@ def extract_serials_with_date(text, default_date):
         serials_in_line = serial_pattern.findall(line)
         if not serials_in_line: continue
         
-        # 同じ行〜下3行を探す
         search_window = lines[i : min(len(lines), i+4)]
         found_date = default_date_str
         for check_line in search_window:
@@ -145,6 +144,55 @@ def get_vol_bonus(count):
 
 # --- 書き込み・計算ロジック ---
 
+def register_new_inventory(data_list):
+    client = get_connection()
+    sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
+    all_records = sheet.get_all_records()
+    df = pd.DataFrame(all_records)
+    current_active = set()
+    if not df.empty and 'ステータス' in df.columns:
+        active_df = df[df['ステータス'].astype(str).str.strip() == '在庫']
+        current_active = set(active_df['シリアルナンバー'].astype(str).tolist())
+    
+    headers = sheet.row_values(1)
+    if not headers: sheet.append_row(EXPECTED_HEADERS)
+
+    rows = []
+    skipped = 0
+    for s, d in data_list:
+        s_str = str(s)
+        if s_str in current_active:
+            skipped += 1
+            continue
+        row = [sanitize_for_json(s_str), "在庫", sanitize_for_json(d), "", "", "", ""]
+        rows.append(row)
+    
+    if rows:
+        try: sheet.append_rows(rows)
+        except Exception as e:
+            st.error(f"保存エラー: {e}")
+            return 0, 0
+    return len(rows), skipped
+
+def register_past_bulk(date_obj, count, total_amount, zone, memo=""):
+    client = get_connection()
+    sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
+    headers = sheet.row_values(1)
+    if not headers: sheet.append_row(EXPECTED_HEADERS)
+    if count <= 0: return 0
+    
+    base_amount = total_amount // count
+    remainder = total_amount % count
+    date_str = date_obj.strftime('%Y-%m-%d')
+    rows = []
+    for i in range(count):
+        dummy_sn = f"OLD-{date_str.replace('-','')}-{uuid.uuid4().hex[:6]}"
+        amount = base_amount + (1 if i < remainder else 0)
+        row = [dummy_sn, "補充済", "", date_str, zone, amount, memo]
+        rows.append(row)
+    if rows: sheet.append_rows(rows)
+    return len(rows)
+
 def recalc_weekly_revenue(sheet, today_date):
     all_records = sheet.get_all_records()
     headers = sheet.row_values(1)
@@ -158,7 +206,10 @@ def recalc_weekly_revenue(sheet, today_date):
     for i, row in enumerate(all_records):
         st_val = str(row.get('ステータス', '')).strip()
         comp_date_str = str(row.get('完了日', ''))
-        if st_val == '補充済' and comp_date_str:
+        sn = str(row.get('シリアルナンバー', ''))
+        memo = str(row.get('備考', ''))
+        
+        if st_val == '補充済' and comp_date_str and not sn.startswith('OLD-') and 'ボーナス' not in memo:
             try:
                 comp_date = datetime.datetime.strptime(comp_date_str, '%Y-%m-%d').date()
                 if start_of_week <= comp_date <= end_of_week:
@@ -193,36 +244,6 @@ def recalc_weekly_revenue(sheet, today_date):
     if cells_to_update:
         sheet.update_cells(cells_to_update)
     return updated_count
-
-def register_new_inventory(data_list):
-    client = get_connection()
-    sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
-    all_records = sheet.get_all_records()
-    df = pd.DataFrame(all_records)
-    current_active = set()
-    if not df.empty and 'ステータス' in df.columns:
-        active_df = df[df['ステータス'].astype(str).str.strip() == '在庫']
-        current_active = set(active_df['シリアルナンバー'].astype(str).tolist())
-    
-    headers = sheet.row_values(1)
-    if not headers: sheet.append_row(EXPECTED_HEADERS)
-
-    rows = []
-    skipped = 0
-    for s, d in data_list:
-        s_str = str(s)
-        if s_str in current_active:
-            skipped += 1
-            continue
-        row = [sanitize_for_json(s_str), "在庫", sanitize_for_json(d), "", "", "", ""]
-        rows.append(row)
-    
-    if rows:
-        try: sheet.append_rows(rows)
-        except Exception as e:
-            st.error(f"保存エラー: {e}")
-            return 0, 0
-    return len(rows), skipped
 
 def update_status_bulk(target_serials, new_status, complete_date=None, zone="", price=0, memo=""):
     client = get_connection()
@@ -312,7 +333,6 @@ def create_card(row, today):
             c, bg, st_t, bd = "#2e7d32", "#f1f8e9", "💎 Bonus", "#81c784"
         else: 
             c, bg, st_t, bd = "#616161", "#ffffff", "🐢 通常", "#bdbdbd"
-        
         date_label = f"取得: {s_str}"
         main_text = last4
 
@@ -328,7 +348,7 @@ def create_card(row, today):
 
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V15", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V18", page_icon="⚡", layout="wide")
     st.markdown("<style>.stSlider{padding-top:1rem;}</style>", unsafe_allow_html=True)
     today = get_today_jst()
 
@@ -343,9 +363,20 @@ def main():
     week_count = 0
     if not df_hist.empty:
         start_of_week = today - datetime.timedelta(days=today.weekday())
-        w_df = df_hist[(df_hist['完了日'] >= start_of_week) & (df_hist['ステータス'] == '補充済')]
-        week_count = len(w_df)
+        df_hist['comp_date'] = pd.to_datetime(df_hist['完了日'], errors='coerce')
+        
+        w_df = df_hist[
+            (df_hist['comp_date'].dt.date >= start_of_week) & 
+            (df_hist['ステータス'] == '補充済')
+        ].copy()
+        
+        # 本数カウント除外ロジック (ボーナス行などは本数に入れない)
+        count_mask = w_df.apply(lambda x: 'ボーナス' not in str(x['備考']), axis=1)
+        w_df_count = w_df[count_mask]
+        
+        week_count = len(w_df_count)
         week_earnings = int(w_df['金額'].sum())
+    
     cur_bonus = get_vol_bonus(week_count)
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["🏠 ホーム", "🔍 検索", "📦 在庫", "💰 収益", "📝 棚卸"])
@@ -441,40 +472,68 @@ def main():
         st.metric("在庫数", f"{len(df_inv)}")
         st.dataframe(df_inv, use_container_width=True)
 
-    # 4. 収益 (週次比較機能追加)
+    # 4. 収益
     with tab4:
         st.metric("今週", f"¥{week_earnings:,}")
         
-        # 週ごとの比較グラフ
+        # 過去データ登録フォーム
+        with st.expander("➕ 過去データの登録 (本数指定)"):
+            st.caption("指定した本数分、行を作成して登録します。")
+            with st.form("manual_past_reg"):
+                c1, c2 = st.columns(2)
+                p_date = c1.date_input("完了日")
+                p_count = c2.number_input("数量 (本)", min_value=1, value=1)
+                p_amount = c1.number_input("合計金額 (円)", step=10)
+                p_zone = c2.selectbox("エリア", ZONE_OPTIONS)
+                p_memo = st.text_input("備考 (任意)", placeholder="ボーナスなど")
+                
+                if st.form_submit_button("登録する"):
+                    reg_cnt = register_past_bulk(p_date, p_count, p_amount, p_zone, p_memo)
+                    st.success(f"{reg_cnt}行 のデータを登録しました")
+                    import time
+                    time.sleep(1)
+                    st.rerun()
+
+        # 週次比較グラフ (V18: 2軸グラフ)
         if not df_hist.empty:
             df_wk = df_hist[df_hist['ステータス'] == '補充済'].copy()
             if not df_wk.empty:
-                # 完了日をTimestamp型に変換して処理
                 df_wk['date'] = pd.to_datetime(df_wk['完了日'])
-                # 月曜始まりの週に丸める
                 df_wk['week_start'] = df_wk['date'].apply(lambda x: x - datetime.timedelta(days=x.weekday()))
                 
-                # 集計
+                # 本数カウント (ボーナス行は除外)
+                df_wk['is_battery'] = df_wk['備考'].apply(lambda x: 0 if 'ボーナス' in str(x) else 1)
+                
                 weekly_agg = df_wk.groupby('week_start').agg(
                     total_amount=('金額', 'sum'),
-                    count=('金額', 'count')
+                    count=('is_battery', 'sum')
                 ).reset_index().sort_values('week_start')
                 
-                # 表示用ラベル (YYYY/MM/DD)
                 weekly_agg['Label'] = weekly_agg['week_start'].dt.strftime('%Y/%m/%d') + " 週"
 
                 st.divider()
                 st.subheader("📈 週次比較 (月〜日)")
                 
-                chart = alt.Chart(weekly_agg).mark_bar().encode(
-                    x=alt.X('Label', sort=None, title='週 (月曜開始)'),
-                    y=alt.Y('total_amount', title='合計金額 (円)'),
-                    tooltip=['Label', alt.Tooltip('total_amount', format=','), alt.Tooltip('count', title='本数')]
-                ).properties(height=300)
+                # 複合グラフ作成 (2軸)
+                base = alt.Chart(weekly_agg).encode(
+                    x=alt.X('Label', sort=None, title='週 (月曜開始)')
+                )
+                bar = base.mark_bar(color='#4fc3f7').encode(
+                    y=alt.Y('total_amount', title='合計金額 (円)', axis=alt.Axis(titleColor='#0277bd')),
+                    tooltip=['Label', alt.Tooltip('total_amount', title='金額', format=','), alt.Tooltip('count', title='本数')]
+                )
+                line = base.mark_line(color='#ff7043', strokeWidth=3).encode(
+                    y=alt.Y('count', title='本数 (本)', axis=alt.Axis(titleColor='#ff7043'))
+                )
+                points = base.mark_circle(color='#ff7043', size=60).encode(
+                    y=alt.Y('count', axis=None),
+                    tooltip=['Label', alt.Tooltip('total_amount', title='金額', format=','), alt.Tooltip('count', title='本数')]
+                )
+                chart = alt.layer(bar, line + points).resolve_scale(y='independent').properties(height=300)
                 
                 st.altair_chart(chart, use_container_width=True)
                 
-                with st.expander("詳細データを見る"):
+                with st.expander("詳細データ"):
                     st.dataframe(weekly_agg[['Label', 'total_amount', 'count']], hide_index=True, use_container_width=True)
 
             st.divider()
