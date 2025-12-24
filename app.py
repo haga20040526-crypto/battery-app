@@ -131,6 +131,7 @@ def get_active_inventory(df_all):
     df = df_all[df_all['ステータス'] == '在庫'].copy()
     if not df.empty:
         df['rev_serial'] = df['シリアルナンバー'].apply(lambda x: x[::-1])
+        # 日付順 > 末尾順
         df_sorted = df.sort_values(by=['保有開始日', 'rev_serial'], ascending=[True, True])
         return df_sorted.drop(columns=['rev_serial'])
     return df
@@ -147,20 +148,16 @@ def get_vol_bonus(count):
 def recalc_weekly_revenue(sheet, today_date):
     all_records = sheet.get_all_records()
     headers = sheet.row_values(1)
-    
-    try:
-        col_price = headers.index('金額') + 1
+    try: col_price = headers.index('金額') + 1
     except: return 0
 
     start_of_week = today_date - datetime.timedelta(days=today_date.weekday())
     end_of_week = start_of_week + datetime.timedelta(days=6)
 
     weekly_indices = []
-    
     for i, row in enumerate(all_records):
         st_val = str(row.get('ステータス', '')).strip()
         comp_date_str = str(row.get('完了日', ''))
-        
         if st_val == '補充済' and comp_date_str:
             try:
                 comp_date = datetime.datetime.strptime(comp_date_str, '%Y-%m-%d').date()
@@ -178,19 +175,16 @@ def recalc_weekly_revenue(sheet, today_date):
         row = all_records[idx]
         zone_name = str(row.get('エリア', ''))
         base_price = ZONES.get(zone_name, 70)
-        
         start_d_str = str(row.get('保有開始日', ''))
         end_d_str = str(row.get('完了日', ''))
         early_bonus = 0
         try:
             s_date = datetime.datetime.strptime(start_d_str, '%Y-%m-%d').date()
             e_date = datetime.datetime.strptime(end_d_str, '%Y-%m-%d').date()
-            if (e_date - s_date).days <= 3:
-                early_bonus = 10
+            if (e_date - s_date).days <= 3: early_bonus = 10
         except: pass
         
         new_total_price = base_price + current_bonus + early_bonus
-        
         current_recorded_price = row.get('金額', 0)
         if current_recorded_price != new_total_price:
             cells_to_update.append(gspread.Cell(idx + 2, col_price, new_total_price))
@@ -198,7 +192,6 @@ def recalc_weekly_revenue(sheet, today_date):
 
     if cells_to_update:
         sheet.update_cells(cells_to_update)
-        
     return updated_count
 
 def register_new_inventory(data_list):
@@ -206,7 +199,6 @@ def register_new_inventory(data_list):
     sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
     all_records = sheet.get_all_records()
     df = pd.DataFrame(all_records)
-    
     current_active = set()
     if not df.empty and 'ステータス' in df.columns:
         active_df = df[df['ステータス'].astype(str).str.strip() == '在庫']
@@ -237,7 +229,6 @@ def update_status_bulk(target_serials, new_status, complete_date=None, zone="", 
     sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
     all_records = sheet.get_all_records()
     headers = sheet.row_values(1)
-    
     try:
         col_status = headers.index('ステータス') + 1
         col_end = headers.index('完了日') + 1
@@ -249,7 +240,6 @@ def update_status_bulk(target_serials, new_status, complete_date=None, zone="", 
     cells = []
     updated = 0
     target_set = set(str(s) for s in target_serials)
-    
     comp_str = sanitize_for_json(complete_date)
     safe_price = int(price)
 
@@ -267,13 +257,10 @@ def update_status_bulk(target_serials, new_status, complete_date=None, zone="", 
             
     if cells:
         try: sheet.update_cells(cells)
-        except Exception as e:
-            st.error(f"更新エラー: {e}")
-            return 0
-            
+        except: return 0
+    
     if updated > 0 and new_status == '補充済' and complete_date:
         recalc_weekly_revenue(sheet, complete_date)
-
     return updated
 
 def update_dates_bulk(updates_list):
@@ -283,23 +270,20 @@ def update_dates_bulk(updates_list):
     headers = sheet.row_values(1)
     if '保有開始日' not in headers: return 0
     col_start = headers.index('保有開始日') + 1
-    
     cells = []
     updates_map = {str(s): sanitize_for_json(d) for s, d in updates_list}
-    
     for i, row in enumerate(all_records):
         s = str(row.get('シリアルナンバー', ''))
         st_val = str(row.get('ステータス', '')).strip()
         if st_val == '在庫' and s in updates_map:
             r = i + 2
             cells.append(gspread.Cell(r, col_start, updates_map[s]))
-            
     if cells:
         try: sheet.update_cells(cells)
         except: return 0
     return len(cells)
 
-# --- UIパーツ (ステータス対応カード) ---
+# --- UIパーツ (V13: 取得日メイン) ---
 def create_card(row, today):
     start_date = row.get('保有開始日')
     status = str(row.get('ステータス', '')).strip()
@@ -312,36 +296,40 @@ def create_card(row, today):
         s_str = start_date.strftime('%m/%d')
         days = (today - start_date).days
     
-    # ステータス別デザイン
     if status == '補充済':
-        c, bg, st_t, bd = "#1565c0", "#e3f2fd", f"✅ 補充済 ({s_str}〜)", "#2196f3"
-        main_text = f"完了"
+        c, bg, st_t, bd = "#1565c0", "#e3f2fd", "✅ 補充済", "#2196f3"
+        date_label = f"完了: {s_str}"
+        main_text = "完了"
     elif status == '不明' or '削除' in status:
         c, bg, st_t, bd = "#616161", "#eeeeee", "🚫 不明/削除", "#9e9e9e"
+        date_label = "-"
         main_text = "Missing"
     else:
-        # 在庫の場合
+        # 在庫 (色はペナルティ基準だが、テキストは日付)
         p_days = PENALTY_LIMIT_DAYS - days
         if p_days <= 5: 
-            c, bg, st_t, bd = "#c62828", "#fff5f5", f"🔥 要返却 (残{p_days}日)", "#e57373"
+            c, bg, st_t, bd = "#c62828", "#fff5f5", "🔥 要返却", "#e57373"
         elif days <= 3: 
             c, bg, st_t, bd = "#2e7d32", "#f1f8e9", "💎 Bonus", "#81c784"
         else: 
-            c, bg, st_t, bd = "#616161", "#ffffff", f"🐢 通常 (残{p_days}日)", "#bdbdbd"
+            c, bg, st_t, bd = "#616161", "#ffffff", "🐢 通常", "#bdbdbd"
+        
+        date_label = f"取得: {s_str}" # ここを変更
         main_text = last4
 
     return textwrap.dedent(f"""
     <div style="background:{bg}; border-radius:8px; border-left:8px solid {bd}; padding:12px; margin-bottom:10px; box-shadow:0 2px 5px rgba(0,0,0,0.1);">
         <div style="display:flex; justify-content:space-between; font-weight:bold; font-size:12px; color:{c};">
-            <div>{st_t}</div><div>SN: {sn}</div>
+            <div>{st_t}</div><div>{date_label}</div>
         </div>
         <div style="font-size:34px; font-weight:900; color:#212121; margin-top:4px;">{main_text}</div>
+        <div style="text-align:right; font-size:10px; color:#999; font-family:monospace;">{sn}</div>
     </div>
     """)
 
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V11", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V13", page_icon="⚡", layout="wide")
     st.markdown("<style>.stSlider{padding-top:1rem;}</style>", unsafe_allow_html=True)
     today = get_today_jst()
 
@@ -414,12 +402,35 @@ def main():
                         st.rerun()
 
         st.divider()
-        if not df_inv.empty:
-            cols = st.columns(4)
-            for i, (_, row) in enumerate(df_inv.head(4).iterrows()):
-                cols[i].markdown(create_card(row, today), unsafe_allow_html=True)
+        
+        # ピックアップ (取得日順)
+        st.markdown("##### 📌 ピックアップ")
+        col_sl, _ = st.columns([1,2])
+        with col_sl:
+            disp_count = st.slider("表示数", 4, 40, 8, step=4)
 
-    # 2. 検索 (カード表示対応)
+        if not df_inv.empty:
+            df_disp = df_inv.copy()
+            # 優先度: 1.危険(期限近), 2.ボーナス(取得3日以内), 3.通常
+            def get_priority(row):
+                days = (today - row['保有開始日']).days
+                if days >= (PENALTY_LIMIT_DAYS - 5): return 1
+                if days <= 3: return 2
+                return 3
+            df_disp['rank'] = df_disp.apply(get_priority, axis=1)
+            # ソート: 優先度 > 日付(古い順)
+            df_disp = df_disp.sort_values(by=['rank', '保有開始日'], ascending=[True, True])
+            
+            top_n = df_disp.head(disp_count)
+            for i in range(0, len(top_n), 4):
+                cols = st.columns(4)
+                chunk = top_n.iloc[i:i+4]
+                for j, (_, row) in enumerate(chunk.iterrows()):
+                    with cols[j]:
+                        st.markdown(create_card(row, today), unsafe_allow_html=True)
+        else: st.info("在庫はありません")
+
+    # 2. 検索
     with tab2:
         sn_in = st.number_input("SN下4桁", 0, 9999, 0)
         if sn_in > 0 and not df_all.empty:
@@ -493,7 +504,6 @@ def main():
                     
                     if msg: st.success(" / ".join(msg))
                     else: st.info("変更なし")
-                    
                     import time
                     time.sleep(1)
                     st.rerun()
