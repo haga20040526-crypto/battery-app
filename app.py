@@ -70,6 +70,7 @@ def extract_serials_with_date(text, default_date):
         serials_in_line = serial_pattern.findall(line)
         if not serials_in_line: continue
         
+        # 同じ行〜下3行を探す
         search_window = lines[i : min(len(lines), i+4)]
         found_date = default_date_str
         for check_line in search_window:
@@ -124,8 +125,6 @@ def get_database():
         for col in ['保有開始日', '完了日']:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors='coerce').dt.date
-        
-        # 削除済みを除外して読み込む（物理削除ではないため）
         return df
     except: return pd.DataFrame()
 
@@ -134,9 +133,8 @@ def get_active_inventory(df_all):
     # 削除済み以外かつ在庫
     df = df_all[df_all['ステータス'] == '在庫'].copy()
     if not df.empty:
-        df['rev_serial'] = df['シリアルナンバー'].apply(lambda x: x[::-1])
-        df_sorted = df.sort_values(by=['保有開始日', 'rev_serial'], ascending=[True, True])
-        return df_sorted.drop(columns=['rev_serial'])
+        # ソートなどの処理はUI側で行うため、ここでは抽出のみ
+        return df
     return df
 
 def get_vol_bonus(count):
@@ -146,22 +144,23 @@ def get_vol_bonus(count):
     elif count >= 20: return 5
     else: return 0
 
-# --- ロジック (V20: 修正・重複処理強化) ---
+# --- 書き込み・計算ロジック ---
 
 def register_new_inventory(data_list):
     """
     新規登録ロジック
-    1) 既存の「在庫」と重複 -> スキップ
-    2) 既存の「補充済」と重複 -> 新規登録 (再取得)
+    1) 手元の在庫と重複 -> スキップ
+    2) 過去の履歴(補充済など)と重複 -> 新規登録(出戻り)
     """
     client = get_connection()
     sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
     all_records = sheet.get_all_records()
     df = pd.DataFrame(all_records)
     
-    # 現在「在庫」になっているシリアルのみを抽出
+    # 現在「在庫」になっているシリアルのみをリスト化
     current_active_serials = set()
     if not df.empty and 'ステータス' in df.columns:
+        # 空白除去して判定
         active_df = df[df['ステータス'].astype(str).str.strip() == '在庫']
         current_active_serials = set(active_df['シリアルナンバー'].astype(str).tolist())
     
@@ -172,6 +171,7 @@ def register_new_inventory(data_list):
     skipped = 0
     for s, d in data_list:
         s_str = str(s)
+        
         # 1) 手元にある(在庫)ならスキップ
         if s_str in current_active_serials:
             skipped += 1
@@ -186,32 +186,6 @@ def register_new_inventory(data_list):
         except: return 0, 0
     return len(rows), skipped
 
-def update_status_single(target_serial, new_status):
-    """単一アイテムのステータス変更（修正ボタン用）"""
-    client = get_connection()
-    sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
-    all_records = sheet.get_all_records()
-    headers = sheet.row_values(1)
-    
-    try:
-        col_status = headers.index('ステータス') + 1
-        col_end = headers.index('完了日') + 1
-    except: return False
-
-    target_str = str(target_serial)
-    
-    # 後ろから検索して、最新の状態のものを変更する
-    for i in range(len(all_records) - 1, -1, -1):
-        row = all_records[i]
-        if str(row.get('シリアルナンバー', '')) == target_str:
-            # 該当行を発見
-            r = i + 2
-            sheet.update_cell(r, col_status, new_status)
-            if new_status == '在庫': # 在庫に戻す時は完了日を消す
-                sheet.update_cell(r, col_end, "")
-            return True
-    return False
-
 def register_past_bulk(date_obj, count, total_amount, zone, memo=""):
     client = get_connection()
     sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
@@ -223,13 +197,11 @@ def register_past_bulk(date_obj, count, total_amount, zone, memo=""):
     remainder = total_amount % count
     date_str = date_obj.strftime('%Y-%m-%d')
     rows = []
-    
     for i in range(count):
         dummy_sn = f"OLD-{date_str.replace('-','')}-{uuid.uuid4().hex[:6]}"
         amount = base_amount + (1 if i < remainder else 0)
         row = [dummy_sn, "補充済", "", date_str, zone, amount, memo]
         rows.append(row)
-    
     if rows: sheet.append_rows(rows)
     return len(rows)
 
@@ -249,7 +221,8 @@ def recalc_weekly_revenue(sheet, today_date):
         sn = str(row.get('シリアルナンバー', ''))
         memo = str(row.get('備考', ''))
         
-        if st_val == '補充済' and comp_date_str and not sn.startswith('OLD-') and 'ボーナス' not in memo:
+        # ボーナス行は除外
+        if st_val == '補充済' and comp_date_str and 'ボーナス' not in memo:
             try:
                 comp_date = datetime.datetime.strptime(comp_date_str, '%Y-%m-%d').date()
                 if start_of_week <= comp_date <= end_of_week:
@@ -386,7 +359,7 @@ def create_card(row, today):
 
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V20", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V21", page_icon="⚡", layout="wide")
     st.markdown("<style>.stSlider{padding-top:1rem;}</style>", unsafe_allow_html=True)
     today = get_today_jst()
 
@@ -396,7 +369,6 @@ def main():
     df_all = get_database()
     
     if not df_all.empty and 'ステータス' in df_all.columns:
-        # 削除済みを除外して表示
         df_valid = df_all[~df_all['ステータス'].str.contains('削除', na=False)]
         df_inv = get_active_inventory(df_valid)
         df_hist = df_valid[df_valid['ステータス'] != '在庫'].copy()
@@ -488,7 +460,7 @@ def main():
                         st.rerun()
 
         st.divider()
-        st.markdown("##### 📌 ピックアップ (推奨順)")
+        st.markdown("##### 📌 ピックアップ (優先順)")
         col_sl, _ = st.columns([1,2])
         with col_sl:
             disp_count = st.slider("表示数", 4, 40, 8, step=4)
@@ -502,6 +474,7 @@ def main():
                 if days <= 3: return 2
                 return 3
             df_disp['rank'] = df_disp.apply(get_priority, axis=1)
+            # 同じランク内では「日付が古い順」
             df_disp = df_disp.sort_values(by=['rank', '保有開始日'], ascending=[True, True])
             
             top_n = df_disp.head(disp_count)
@@ -524,24 +497,13 @@ def main():
                     st.markdown(create_card(row, today), unsafe_allow_html=True)
             else: st.warning("なし")
 
-    # 3. 在庫 (削除ボタン追加)
+    # 3. 在庫 (シンプル版)
     with tab3:
         st.metric("在庫数", f"{len(df_inv)}")
         if not df_inv.empty:
-            for i, row in df_inv.iterrows():
-                c1, c2 = st.columns([4, 1])
-                with c1:
-                    st.write(f"**{row['シリアルナンバー'][-4:]}** ({row['シリアルナンバー']}) - {row['保有開始日']}")
-                with c2:
-                    if st.button("🗑️", key=f"del_{row['シリアルナンバー']}"):
-                        if update_status_single(row['シリアルナンバー'], "削除済"):
-                            st.success("削除しました")
-                            import time
-                            time.sleep(0.5)
-                            st.rerun()
-            st.divider()
+            st.dataframe(df_inv, use_container_width=True)
 
-    # 4. 収益 (修正ボタン追加)
+    # 4. 収益 (シンプル版)
     with tab4:
         st.metric("今週", f"¥{week_earnings:,}")
         
@@ -588,21 +550,8 @@ def main():
                 )
                 st.altair_chart(alt.layer(bar, line + points).resolve_scale(y='independent').properties(height=300), use_container_width=True)
                 
-                with st.expander("詳細リスト (修正はこちら)"):
-                    # 修正用リスト表示
-                    # 直近20件を表示
-                    recent_hist = df_wk.sort_values('date', ascending=False).head(20)
-                    for i, row in recent_hist.iterrows():
-                        c1, c2, c3 = st.columns([3, 2, 1])
-                        with c1: st.write(f"{row['完了日']} - ¥{row['金額']}")
-                        with c2: st.caption(f"{row['シリアルナンバー']}")
-                        with c3:
-                            if st.button("↩️戻す", key=f"rev_{row['シリアルナンバー']}"):
-                                if update_status_single(row['シリアルナンバー'], "在庫"):
-                                    st.success("在庫に戻しました")
-                                    import time
-                                    time.sleep(0.5)
-                                    st.rerun()
+                with st.expander("詳細リスト"):
+                    st.dataframe(df_wk.sort_values('date', ascending=False), use_container_width=True)
 
     # 5. 棚卸
     with tab5:
