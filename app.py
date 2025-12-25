@@ -70,7 +70,6 @@ def extract_serials_with_date(text, default_date):
         serials_in_line = serial_pattern.findall(line)
         if not serials_in_line: continue
         
-        # 同じ行〜下3行を探す
         search_window = lines[i : min(len(lines), i+4)]
         found_date = default_date_str
         for check_line in search_window:
@@ -130,10 +129,10 @@ def get_database():
 
 def get_active_inventory(df_all):
     if df_all.empty or 'ステータス' not in df_all.columns: return pd.DataFrame()
-    # 削除済み以外かつ在庫
     df = df_all[df_all['ステータス'] == '在庫'].copy()
     if not df.empty:
-        # ソートなどの処理はUI側で行うため、ここでは抽出のみ
+        # 古い順にソート
+        df = df.sort_values(by=['保有開始日'], ascending=[True])
         return df
     return df
 
@@ -147,20 +146,13 @@ def get_vol_bonus(count):
 # --- 書き込み・計算ロジック ---
 
 def register_new_inventory(data_list):
-    """
-    新規登録ロジック
-    1) 手元の在庫と重複 -> スキップ
-    2) 過去の履歴(補充済など)と重複 -> 新規登録(出戻り)
-    """
     client = get_connection()
     sheet = client.open('battery_db').worksheet(NEW_SHEET_NAME)
     all_records = sheet.get_all_records()
     df = pd.DataFrame(all_records)
     
-    # 現在「在庫」になっているシリアルのみをリスト化
     current_active_serials = set()
     if not df.empty and 'ステータス' in df.columns:
-        # 空白除去して判定
         active_df = df[df['ステータス'].astype(str).str.strip() == '在庫']
         current_active_serials = set(active_df['シリアルナンバー'].astype(str).tolist())
     
@@ -171,13 +163,9 @@ def register_new_inventory(data_list):
     skipped = 0
     for s, d in data_list:
         s_str = str(s)
-        
-        # 1) 手元にある(在庫)ならスキップ
         if s_str in current_active_serials:
             skipped += 1
             continue
-        
-        # 2) それ以外(新規 or 補充済からの出戻り)なら登録
         row = [sanitize_for_json(s_str), "在庫", sanitize_for_json(d), "", "", "", ""]
         rows.append(row)
     
@@ -221,7 +209,6 @@ def recalc_weekly_revenue(sheet, today_date):
         sn = str(row.get('シリアルナンバー', ''))
         memo = str(row.get('備考', ''))
         
-        # ボーナス行は除外
         if st_val == '補充済' and comp_date_str and 'ボーナス' not in memo:
             try:
                 comp_date = datetime.datetime.strptime(comp_date_str, '%Y-%m-%d').date()
@@ -336,7 +323,6 @@ def create_card(row, today):
         date_label = "-"
         main_text = "不明"
     else:
-        # 在庫 (ロジック確定版)
         p_days = PENALTY_LIMIT_DAYS - days
         if p_days <= 5: 
             c, bg, st_t, bd = "#c62828", "#ffebee", f"🔥 残{p_days}日", "#ef5350"
@@ -359,7 +345,7 @@ def create_card(row, today):
 
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V21", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V23", page_icon="⚡", layout="wide")
     st.markdown("<style>.stSlider{padding-top:1rem;}</style>", unsafe_allow_html=True)
     today = get_today_jst()
 
@@ -467,14 +453,12 @@ def main():
 
         if not df_inv.empty:
             df_disp = df_inv.copy()
-            # 優先順位: 1.期限近(残5日), 2.ボーナス(3日以内), 3.通常(古い順)
             def get_priority(row):
                 days = (today - row['保有開始日']).days
                 if days >= (PENALTY_LIMIT_DAYS - 5): return 1
                 if days <= 3: return 2
                 return 3
             df_disp['rank'] = df_disp.apply(get_priority, axis=1)
-            # 同じランク内では「日付が古い順」
             df_disp = df_disp.sort_values(by=['rank', '保有開始日'], ascending=[True, True])
             
             top_n = df_disp.head(disp_count)
@@ -497,13 +481,13 @@ def main():
                     st.markdown(create_card(row, today), unsafe_allow_html=True)
             else: st.warning("なし")
 
-    # 3. 在庫 (シンプル版)
+    # 3. 在庫 (V23: 列絞り込み)
     with tab3:
         st.metric("在庫数", f"{len(df_inv)}")
         if not df_inv.empty:
-            st.dataframe(df_inv, use_container_width=True)
+            st.dataframe(df_inv[['保有開始日', 'シリアルナンバー']], use_container_width=True)
 
-    # 4. 収益 (シンプル版)
+    # 4. 収益 (V23: 列絞り込み)
     with tab4:
         st.metric("今週", f"¥{week_earnings:,}")
         
@@ -532,12 +516,14 @@ def main():
                 weekly_agg = df_wk.groupby('week_start').agg(
                     total_amount=('金額', 'sum'),
                     count=('is_battery', 'sum')
-                ).reset_index().sort_values('week_start')
+                ).reset_index().sort_values('week_start', ascending=False)
                 weekly_agg['Label'] = weekly_agg['week_start'].dt.strftime('%Y/%m/%d') + " 週"
 
                 st.divider()
                 st.subheader("📈 週次比較")
-                base = alt.Chart(weekly_agg).encode(x=alt.X('Label', sort=None, title='週'))
+                
+                chart_data = weekly_agg.sort_values('week_start', ascending=True)
+                base = alt.Chart(chart_data).encode(x=alt.X('Label', sort=None, title='週'))
                 bar = base.mark_bar(color='#4fc3f7').encode(
                     y=alt.Y('total_amount', title='金額', axis=alt.Axis(titleColor='#0277bd')),
                     tooltip=['Label', 'total_amount', 'count']
@@ -550,8 +536,15 @@ def main():
                 )
                 st.altair_chart(alt.layer(bar, line + points).resolve_scale(y='independent').properties(height=300), use_container_width=True)
                 
-                with st.expander("詳細リスト"):
-                    st.dataframe(df_wk.sort_values('date', ascending=False), use_container_width=True)
+                st.markdown("##### 📊 週間集計")
+                display_df = weekly_agg[['Label', 'total_amount', 'count']].rename(
+                    columns={'Label': '週 (月曜開始)', 'total_amount': '合計金額 (円)', 'count': '本数 (本)'}
+                )
+                st.dataframe(display_df, hide_index=True, use_container_width=True)
+                
+                with st.expander("詳細リスト (全履歴)"):
+                    display_cols = ['完了日', '金額', 'シリアルナンバー', 'エリア', '備考']
+                    st.dataframe(df_wk.sort_values('date', ascending=False)[display_cols], use_container_width=True)
 
     # 5. 棚卸
     with tab5:
