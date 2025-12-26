@@ -131,7 +131,6 @@ def get_active_inventory(df_all):
     if df_all.empty or 'ステータス' not in df_all.columns: return pd.DataFrame()
     df = df_all[df_all['ステータス'] == '在庫'].copy()
     if not df.empty:
-        # 古い順にソート
         df = df.sort_values(by=['保有開始日'], ascending=[True])
         return df
     return df
@@ -318,10 +317,10 @@ def create_card(row, today):
         c, bg, st_t, bd = "#1565c0", "#e3f2fd", "✅ 完了", "#2196f3"
         date_label = f"完了: {s_str}"
         main_text = "補充済"
-    elif status == '不明' or '削除' in status:
+    elif status == '不明' or '削除' in status or 'エラー' in status:
         c, bg, st_t, bd = "#757575", "#f5f5f5", "🚫 除外", "#bdbdbd"
         date_label = "-"
-        main_text = "不明"
+        main_text = "除外済"
     else:
         p_days = PENALTY_LIMIT_DAYS - days
         if p_days <= 5: 
@@ -345,7 +344,28 @@ def create_card(row, today):
 
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V23", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V24", page_icon="⚡", layout="wide")
+    
+    # ▼ 画像ファイル不要のHTMLロゴ実装 ▼
+    st.markdown("""
+        <div style='display: flex; align-items: center; margin-bottom: 20px;'>
+            <div style='
+                background: linear-gradient(135deg, #2196f3, #64b5f6);
+                width: 50px; height: 50px;
+                border-radius: 12px;
+                display: flex; align-items: center; justify-content: center;
+                font-size: 30px; margin-right: 15px;
+                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                color: white;'>
+                ⚡
+            </div>
+            <div>
+                <h1 style='margin: 0; padding: 0; font-size: 28px; color: #333;'>Battery Manager <span style='font-size:16px; color:#1565c0; background:#e3f2fd; padding:2px 8px; border-radius:10px; vertical-align: middle;'>V24</span></h1>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+    # ▲ ここまで ▲
+
     st.markdown("<style>.stSlider{padding-top:1rem;}</style>", unsafe_allow_html=True)
     today = get_today_jst()
 
@@ -481,13 +501,13 @@ def main():
                     st.markdown(create_card(row, today), unsafe_allow_html=True)
             else: st.warning("なし")
 
-    # 3. 在庫 (V23: 列絞り込み)
+    # 3. 在庫
     with tab3:
         st.metric("在庫数", f"{len(df_inv)}")
         if not df_inv.empty:
             st.dataframe(df_inv[['保有開始日', 'シリアルナンバー']], use_container_width=True)
 
-    # 4. 収益 (V23: 列絞り込み)
+    # 4. 収益
     with tab4:
         st.metric("今週", f"¥{week_earnings:,}")
         
@@ -549,16 +569,16 @@ def main():
     # 5. 棚卸
     with tab5:
         st.subheader("在庫棚卸し")
+        st.caption("SpotJobsの「保有リスト(全量)」を貼り付けると、新規追加と消失検知が同時に行えます。")
+        
         cur = st.session_state['stocktake_buffer']
         c1, c2 = st.columns([1,1])
         with c1:
-            txt_stock = st.text_area("リスト追加")
-            if st.button("リストに追加"):
+            txt_stock = st.text_area("全リスト貼付")
+            if st.button("リストを読込"):
                 if txt_stock:
                     add = extract_serials_with_date(txt_stock, today)
-                    st.session_state['stocktake_buffer'].extend(add)
-                    uniq = {s:d for s,d in st.session_state['stocktake_buffer']}
-                    st.session_state['stocktake_buffer'] = list(uniq.items())
+                    st.session_state['stocktake_buffer'] = add
                     st.rerun()
             if st.button("クリア"):
                 st.session_state['stocktake_buffer'] = []
@@ -568,46 +588,50 @@ def main():
             if cur: st.dataframe(pd.DataFrame(cur, columns=["SN","日付"]), height=150, hide_index=True)
 
         st.divider()
-        c_act1, c_act2 = st.columns(2)
-        with c_act1:
-            if st.button("照合＆登録・更新", type="primary", use_container_width=True):
-                if cur:
-                    s_map = {s:d for s,d in cur}
-                    db_map = {}
-                    if not df_inv.empty:
-                        db_map = dict(zip(df_inv['シリアルナンバー'], df_inv['保有開始日']))
-                    
-                    def fdate(d): return d.strftime('%Y-%m-%d') if pd.notnull(d) else ""
-                    
-                    missing_db = []
-                    date_mis = []
-                    for s, d in s_map.items():
-                        if s not in db_map: missing_db.append((s, d))
-                        elif fdate(db_map[s]) != d: date_mis.append((s, d))
-                    
-                    msg = []
-                    if missing_db:
+        
+        if cur:
+            s_map = {s:d for s,d in cur}
+            input_set = set(s_map.keys())
+            
+            db_map = {}
+            if not df_inv.empty:
+                db_map = dict(zip(df_inv['シリアルナンバー'], df_inv['保有開始日']))
+            db_set = set(db_map.keys())
+            
+            # 不足分 (DBにない -> 新規登録)
+            missing_db = []
+            for s, d in s_map.items():
+                if s not in db_map: missing_db.append((s, d))
+            
+            # 過剰分 (DBにあるがリストにない -> 補充エラー候補)
+            ghosts = list(db_set - input_set)
+            
+            c_act1, c_act2 = st.columns(2)
+            
+            with c_act1:
+                st.markdown(f"**① 新規在庫: {len(missing_db)}件**")
+                if missing_db:
+                    if st.button("新規分を登録", type="primary"):
                         cnt, _ = register_new_inventory(missing_db)
-                        msg.append(f"新規: {cnt}件")
-                    if date_mis:
-                        cnt = update_dates_bulk(date_mis)
-                        msg.append(f"日付更新: {cnt}件")
-                    
-                    if msg: st.success(" / ".join(msg))
-                    else: st.info("変更なし")
-                    import time
-                    time.sleep(1)
-                    st.rerun()
-                else: st.warning("リストなし")
-
-        with c_act2:
-            if st.button("強制全件登録 (救済)", use_container_width=True):
-                if cur:
-                    cnt, skip = register_new_inventory(cur)
-                    st.success(f"{cnt}件 強制登録")
-                    import time
-                    time.sleep(1)
-                    st.rerun()
+                        st.success(f"{cnt}件 登録しました")
+                        import time
+                        time.sleep(1)
+                        st.rerun()
+                else: st.info("新規なし")
+                
+            with c_act2:
+                st.markdown(f"**② 消失・エラー検知: {len(ghosts)}件**")
+                if ghosts:
+                    st.warning("アプリにはあるが、リストにない在庫です。")
+                    with st.expander("詳細を確認"):
+                        st.write(ghosts)
+                    if st.button("一括「補充エラー」にする"):
+                        cnt = update_status_bulk(ghosts, "補充エラー", today, "", 0, "棚卸検知")
+                        st.success(f"{cnt}件 を在庫から除外しました")
+                        import time
+                        time.sleep(1)
+                        st.rerun()
+                else: st.success("差異なし")
 
 if __name__ == '__main__':
     main()
