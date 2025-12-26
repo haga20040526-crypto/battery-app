@@ -344,23 +344,15 @@ def create_card(row, today):
 
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V24", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V25", page_icon="⚡", layout="wide")
     
-    # ▼ 画像ファイル不要のHTMLロゴ実装 ▼
+    # ▼ V25 ヘッダーデザイン（シンプル・モダン・オレンジアクセント） ▼
     st.markdown("""
-        <div style='display: flex; align-items: center; margin-bottom: 20px;'>
-            <div style='
-                background: linear-gradient(135deg, #2196f3, #64b5f6);
-                width: 50px; height: 50px;
-                border-radius: 12px;
-                display: flex; align-items: center; justify-content: center;
-                font-size: 30px; margin-right: 15px;
-                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                color: white;'>
-                ⚡
-            </div>
+        <div style='display: flex; align-items: center; border-bottom: 2px solid #ff7043; padding-bottom: 10px; margin-bottom: 20px;'>
+            <div style='font-size: 40px; margin-right: 15px;'>⚡</div>
             <div>
-                <h1 style='margin: 0; padding: 0; font-size: 28px; color: #333;'>Battery Manager <span style='font-size:16px; color:#1565c0; background:#e3f2fd; padding:2px 8px; border-radius:10px; vertical-align: middle;'>V24</span></h1>
+                <h1 style='margin: 0; padding: 0; font-size: 32px; color: #333; font-family: sans-serif; letter-spacing: -1px;'>Battery Manager</h1>
+                <div style='font-size: 14px; color: #757575;'>Profit Optimization & Inventory Control <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V25</span></div>
             </div>
         </div>
     """, unsafe_allow_html=True)
@@ -598,12 +590,10 @@ def main():
                 db_map = dict(zip(df_inv['シリアルナンバー'], df_inv['保有開始日']))
             db_set = set(db_map.keys())
             
-            # 不足分 (DBにない -> 新規登録)
             missing_db = []
             for s, d in s_map.items():
                 if s not in db_map: missing_db.append((s, d))
             
-            # 過剰分 (DBにあるがリストにない -> 補充エラー候補)
             ghosts = list(db_set - input_set)
             
             c_act1, c_act2 = st.columns(2)
