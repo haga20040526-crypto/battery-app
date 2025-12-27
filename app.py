@@ -342,17 +342,69 @@ def create_card(row, today):
     </div>
     """)
 
+def create_history_card(row):
+    # 収益タブ用のリッチな履歴カード
+    comp_date = pd.to_datetime(row['完了日']).strftime('%m/%d')
+    amount = row['金額']
+    memo = str(row['備考'])
+    sn = str(row['シリアルナンバー'])
+    zone = str(row['エリア'])
+    
+    # 種類の判定とデザイン定義
+    if "ボーナス" in memo or "差額" in memo:
+        job_type = "ボーナス/調整"
+        icon = "✨"
+        bg = "#fff8e1" # 薄い黄色
+        border = "#ffb300"
+        sn_disp = memo
+    elif "エラー" in memo:
+        job_type = "エラー処理"
+        icon = "⚠️"
+        bg = "#ffebee" # 薄い赤
+        border = "#ef5350"
+        sn_disp = f"SN: {sn[-4:]}"
+    else:
+        job_type = "バッテリー補充"
+        icon = "🔋"
+        bg = "#ffffff"
+        border = "#e0e0e0"
+        sn_disp = f"SN: {sn[-4:]} ({zone})"
+
+    return textwrap.dedent(f"""
+    <div style="
+        background:{bg}; 
+        border:1px solid {border}; 
+        border-radius:8px; 
+        padding:10px 14px; 
+        margin-bottom:8px; 
+        display:flex; 
+        align-items:center;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
+        
+        <div style="font-size:24px; margin-right:12px;">{icon}</div>
+        
+        <div style="flex-grow:1;">
+            <div style="font-size:13px; font-weight:bold; color:#424242;">{job_type}</div>
+            <div style="font-size:11px; color:#757575;">{comp_date} | {sn_disp}</div>
+        </div>
+        
+        <div style="text-align:right;">
+            <div style="font-size:16px; font-weight:900; color:#212121;">¥{amount}</div>
+        </div>
+    </div>
+    """)
+
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V26", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V27", page_icon="⚡", layout="wide")
     
-    # ▼ ヘッダーデザイン ▼
+    # ▼ ヘッダー ▼
     st.markdown("""
         <div style='display: flex; align-items: center; border-bottom: 2px solid #ff7043; padding-bottom: 10px; margin-bottom: 20px;'>
             <div style='font-size: 40px; margin-right: 15px;'>⚡</div>
             <div>
                 <h1 style='margin: 0; padding: 0; font-size: 32px; color: #333; font-family: sans-serif; letter-spacing: -1px;'>Battery Manager</h1>
-                <div style='font-size: 14px; color: #757575;'>Profit Optimization & Inventory Control <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V26</span></div>
+                <div style='font-size: 14px; color: #757575;'>Profit Optimization & Inventory Control <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V27</span></div>
             </div>
         </div>
     """, unsafe_allow_html=True)
@@ -375,21 +427,33 @@ def main():
         df_hist = pd.DataFrame()
 
     week_earnings = 0
+    last_week_earnings = 0 # V27: 先週比用
     week_count = 0
     next_bonus_at = 20
     
     if not df_hist.empty:
         start_of_week = today - datetime.timedelta(days=today.weekday())
+        last_week_start = start_of_week - datetime.timedelta(days=7) # V27
+        
         df_hist['comp_date'] = pd.to_datetime(df_hist['完了日'], errors='coerce')
         
+        # 今週データ
         w_df = df_hist[
             (df_hist['comp_date'].dt.date >= start_of_week) & 
             (df_hist['ステータス'] == '補充済')
         ].copy()
         
+        # 先週データ (V27)
+        lw_df = df_hist[
+            (df_hist['comp_date'].dt.date >= last_week_start) & 
+            (df_hist['comp_date'].dt.date < start_of_week) & 
+            (df_hist['ステータス'] == '補充済')
+        ].copy()
+
         count_mask = w_df.apply(lambda x: 'ボーナス' not in str(x['備考']), axis=1)
         week_count = len(w_df[count_mask])
         week_earnings = int(w_df['金額'].sum())
+        last_week_earnings = int(lw_df['金額'].sum()) # V27
         
         if week_count < 20: next_bonus_at = 20
         elif week_count < 50: next_bonus_at = 50
@@ -411,7 +475,7 @@ def main():
     # 1. ホーム
     with tab1:
         c1, c2, c3 = st.columns(3)
-        c1.metric("報酬", f"¥ {week_earnings:,}")
+        c1.metric("報酬", f"¥ {week_earnings:,}", delta=f"{week_earnings - last_week_earnings:,} 円 (先週比)") # V27 delta追加
         c2.metric("本数", f"{week_count} 本")
         c3.metric("現在ボナ", f"+{cur_bonus}円/本")
         st.divider()
@@ -482,13 +546,12 @@ def main():
                         st.markdown(create_card(row, today), unsafe_allow_html=True)
         else: st.info("現在、在庫はありません")
 
-    # 2. 検索 (V26: 日付絞り込み追加)
+    # 2. 検索
     with tab2:
-        # 日付リスト作成 (在庫のみ)
         date_options = ["指定なし"]
         date_map = {}
         if not df_inv.empty:
-            unique_dates = sorted(df_inv['保有開始日'].unique(), reverse=True) # 新しい順
+            unique_dates = sorted(df_inv['保有開始日'].unique(), reverse=True)
             for d in unique_dates:
                 if pd.notnull(d):
                     label = d.strftime('%m/%d')
@@ -501,14 +564,12 @@ def main():
         with c_s2:
             sn_in = st.number_input("SN下4桁", 0, 9999, 0)
 
-        # 検索ロジック
         results = pd.DataFrame()
         
-        # 1. 日付指定がある場合 -> 在庫から検索
         if sel_date != "指定なし":
             target_date = date_map[sel_date]
             results = df_inv[df_inv['保有開始日'] == target_date].copy()
-            if sn_in > 0: # 番号もあればさらに絞り込み
+            if sn_in > 0:
                 results = results[results['シリアルナンバー'].str.endswith(str(sn_in))]
             
             if not results.empty:
@@ -518,7 +579,6 @@ def main():
             else:
                 st.warning("該当なし")
 
-        # 2. 日付指定なし & 番号あり -> 全期間から検索 (既存機能)
         elif sn_in > 0:
             if not df_all.empty:
                 results = df_all[df_all['シリアルナンバー'].str.endswith(str(sn_in))]
@@ -538,9 +598,9 @@ def main():
         if not df_inv.empty:
             st.dataframe(df_inv[['保有開始日', 'シリアルナンバー']], use_container_width=True)
 
-    # 4. 収益
+    # 4. 収益 (V27: 履歴カード化 & 先週比)
     with tab4:
-        st.metric("今週", f"¥{week_earnings:,}")
+        st.metric("今週", f"¥{week_earnings:,}", delta=f"{week_earnings - last_week_earnings:,} 円 (先週比)")
         
         with st.expander("➕ 過去データの登録"):
             with st.form("manual_past_reg"):
@@ -571,15 +631,23 @@ def main():
                 weekly_agg['Label'] = weekly_agg['week_start'].dt.strftime('%Y/%m/%d') + " 週"
 
                 st.divider()
+                st.subheader("📊 履歴タイムライン")
+                
+                # 直近の履歴をカード表示 (最大30件)
+                recent_history = df_wk.sort_values('date', ascending=False).head(30)
+                for _, row in recent_history.iterrows():
+                    st.markdown(create_history_card(row), unsafe_allow_html=True)
+
+                st.divider()
                 st.subheader("📈 週次比較")
                 
                 chart_data = weekly_agg.sort_values('week_start', ascending=True)
                 base = alt.Chart(chart_data).encode(x=alt.X('Label', sort=None, title='週'))
-                bar = base.mark_bar(color='#4fc3f7').encode(
-                    y=alt.Y('total_amount', title='金額', axis=alt.Axis(titleColor='#0277bd')),
+                bar = base.mark_bar(color='#ffcc80').encode( # 薄いオレンジ
+                    y=alt.Y('total_amount', title='金額', axis=alt.Axis(titleColor='#ff7043')),
                     tooltip=['Label', 'total_amount', 'count']
                 )
-                line = base.mark_line(color='#ff7043', strokeWidth=3).encode(
+                line = base.mark_line(color='#ff7043', strokeWidth=3).encode( # 濃いオレンジ
                     y=alt.Y('count', title='本数', axis=alt.Axis(titleColor='#ff7043'))
                 )
                 points = base.mark_circle(color='#ff7043', size=60).encode(
@@ -587,15 +655,11 @@ def main():
                 )
                 st.altair_chart(alt.layer(bar, line + points).resolve_scale(y='independent').properties(height=300), use_container_width=True)
                 
-                st.markdown("##### 📊 週間集計")
+                st.markdown("##### 📅 週間集計")
                 display_df = weekly_agg[['Label', 'total_amount', 'count']].rename(
                     columns={'Label': '週 (月曜開始)', 'total_amount': '合計金額 (円)', 'count': '本数 (本)'}
                 )
                 st.dataframe(display_df, hide_index=True, use_container_width=True)
-                
-                with st.expander("詳細リスト (全履歴)"):
-                    display_cols = ['完了日', '金額', 'シリアルナンバー', 'エリア', '備考']
-                    st.dataframe(df_wk.sort_values('date', ascending=False)[display_cols], use_container_width=True)
 
     # 5. 棚卸
     with tab5:
