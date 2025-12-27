@@ -344,15 +344,15 @@ def create_card(row, today):
 
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V25", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V26", page_icon="⚡", layout="wide")
     
-    # ▼ V25 ヘッダーデザイン（シンプル・モダン・オレンジアクセント） ▼
+    # ▼ ヘッダーデザイン ▼
     st.markdown("""
         <div style='display: flex; align-items: center; border-bottom: 2px solid #ff7043; padding-bottom: 10px; margin-bottom: 20px;'>
             <div style='font-size: 40px; margin-right: 15px;'>⚡</div>
             <div>
                 <h1 style='margin: 0; padding: 0; font-size: 32px; color: #333; font-family: sans-serif; letter-spacing: -1px;'>Battery Manager</h1>
-                <div style='font-size: 14px; color: #757575;'>Profit Optimization & Inventory Control <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V25</span></div>
+                <div style='font-size: 14px; color: #757575;'>Profit Optimization & Inventory Control <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V26</span></div>
             </div>
         </div>
     """, unsafe_allow_html=True)
@@ -482,16 +482,55 @@ def main():
                         st.markdown(create_card(row, today), unsafe_allow_html=True)
         else: st.info("現在、在庫はありません")
 
-    # 2. 検索
+    # 2. 検索 (V26: 日付絞り込み追加)
     with tab2:
-        sn_in = st.number_input("SN下4桁", 0, 9999, 0)
-        if sn_in > 0 and not df_all.empty:
-            hits = df_all[df_all['シリアルナンバー'].str.endswith(str(sn_in))]
-            if not hits.empty:
-                st.success(f"{len(hits)}件 ヒット")
-                for _, row in hits.iterrows():
+        # 日付リスト作成 (在庫のみ)
+        date_options = ["指定なし"]
+        date_map = {}
+        if not df_inv.empty:
+            unique_dates = sorted(df_inv['保有開始日'].unique(), reverse=True) # 新しい順
+            for d in unique_dates:
+                if pd.notnull(d):
+                    label = d.strftime('%m/%d')
+                    date_options.append(label)
+                    date_map[label] = d
+
+        c_s1, c_s2 = st.columns(2)
+        with c_s1:
+            sel_date = st.selectbox("保有開始日 (在庫のみ)", date_options)
+        with c_s2:
+            sn_in = st.number_input("SN下4桁", 0, 9999, 0)
+
+        # 検索ロジック
+        results = pd.DataFrame()
+        
+        # 1. 日付指定がある場合 -> 在庫から検索
+        if sel_date != "指定なし":
+            target_date = date_map[sel_date]
+            results = df_inv[df_inv['保有開始日'] == target_date].copy()
+            if sn_in > 0: # 番号もあればさらに絞り込み
+                results = results[results['シリアルナンバー'].str.endswith(str(sn_in))]
+            
+            if not results.empty:
+                st.success(f"{len(results)}件 (保有日: {sel_date})")
+                for _, row in results.iterrows():
                     st.markdown(create_card(row, today), unsafe_allow_html=True)
-            else: st.warning("なし")
+            else:
+                st.warning("該当なし")
+
+        # 2. 日付指定なし & 番号あり -> 全期間から検索 (既存機能)
+        elif sn_in > 0:
+            if not df_all.empty:
+                results = df_all[df_all['シリアルナンバー'].str.endswith(str(sn_in))]
+                if not results.empty:
+                    st.success(f"{len(results)}件 ヒット (全期間)")
+                    for _, row in results.iterrows():
+                        st.markdown(create_card(row, today), unsafe_allow_html=True)
+                else:
+                    st.warning("なし")
+        
+        else:
+            st.info("条件を指定してください")
 
     # 3. 在庫
     with tab3:
