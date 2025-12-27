@@ -332,7 +332,6 @@ def create_card(row, today):
         date_label = f"取得: {s_str}"
         main_text = last4
 
-    # HTML生成（インデント対策済み）
     html = f"""
     <div style="background:{bg}; border-radius:8px; border-left:6px solid {bd}; padding:10px; margin-bottom:8px; box-shadow:0 1px 3px rgba(0,0,0,0.1);">
         <div style="display:flex; justify-content:space-between; font-size:11px; font-weight:bold; color:{c};">
@@ -345,7 +344,6 @@ def create_card(row, today):
     return html
 
 def create_history_card(row):
-    # 収益タブ用のリッチな履歴カード
     comp_date = pd.to_datetime(row['完了日']).strftime('%m/%d')
     amount = row['金額']
     memo = str(row['備考'])
@@ -371,17 +369,16 @@ def create_history_card(row):
         border = "#e0e0e0"
         sn_disp = f"SN: {sn[-4:]} ({zone})"
 
-    # 修正点: HTMLを1行にまとめて記述し、インデント問題を回避
+    # HTMLインデント問題を回避した一行書き
     html = f"""<div style="background:{bg}; border:1px solid {border}; border-radius:8px; padding:10px 14px; margin-bottom:8px; display:flex; align-items:center; box-shadow: 0 1px 2px rgba(0,0,0,0.05);"><div style="font-size:24px; margin-right:12px;">{icon}</div><div style="flex-grow:1;"><div style="font-size:13px; font-weight:bold; color:#424242;">{job_type}</div><div style="font-size:11px; color:#757575;">{comp_date} | {sn_disp}</div></div><div style="text-align:right;"><div style="font-size:16px; font-weight:900; color:#212121;">¥{amount}</div></div></div>"""
-    
     return html
 
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V28", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V29", page_icon="⚡", layout="wide")
     
-    # ヘッダー (インデント対策済み)
-    st.markdown("""<div style='display: flex; align-items: center; border-bottom: 2px solid #ff7043; padding-bottom: 10px; margin-bottom: 20px;'><div style='font-size: 40px; margin-right: 15px;'>⚡</div><div><h1 style='margin: 0; padding: 0; font-size: 32px; color: #333; font-family: sans-serif; letter-spacing: -1px;'>Battery Manager</h1><div style='font-size: 14px; color: #757575;'>Profit Optimization & Inventory Control <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V28</span></div></div></div>""", unsafe_allow_html=True)
+    # ヘッダー
+    st.markdown("""<div style='display: flex; align-items: center; border-bottom: 2px solid #ff7043; padding-bottom: 10px; margin-bottom: 20px;'><div style='font-size: 40px; margin-right: 15px;'>⚡</div><div><h1 style='margin: 0; padding: 0; font-size: 32px; color: #333; font-family: sans-serif; letter-spacing: -1px;'>Battery Manager</h1><div style='font-size: 14px; color: #757575;'>Profit Optimization & Inventory Control <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V29</span></div></div></div>""", unsafe_allow_html=True)
 
     st.markdown("<style>.stSlider{padding-top:1rem;}</style>", unsafe_allow_html=True)
     today = get_today_jst()
@@ -604,7 +601,10 @@ def main():
                 st.divider()
                 st.subheader("📊 履歴タイムライン")
                 
-                recent_history = df_wk.sort_values('date', ascending=False).head(30)
+                # V29: 並び順修正 (日付降順 > インデックス降順)
+                df_wk['orig_index'] = df_wk.index
+                recent_history = df_wk.sort_values(by=['date', 'orig_index'], ascending=[False, False]).head(30)
+                
                 for _, row in recent_history.iterrows():
                     st.markdown(create_history_card(row), unsafe_allow_html=True)
 
