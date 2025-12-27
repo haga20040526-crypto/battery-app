@@ -332,7 +332,8 @@ def create_card(row, today):
         date_label = f"取得: {s_str}"
         main_text = last4
 
-    return textwrap.dedent(f"""
+    # HTML生成（インデント対策済み）
+    html = f"""
     <div style="background:{bg}; border-radius:8px; border-left:6px solid {bd}; padding:10px; margin-bottom:8px; box-shadow:0 1px 3px rgba(0,0,0,0.1);">
         <div style="display:flex; justify-content:space-between; font-size:11px; font-weight:bold; color:{c};">
             <div>{st_t}</div><div>{date_label}</div>
@@ -340,7 +341,8 @@ def create_card(row, today):
         <div style="font-size:28px; font-weight:900; color:#212121; margin-top:2px; letter-spacing:1px;">{main_text}</div>
         <div style="text-align:right; font-size:9px; color:#999; font-family:monospace;">{sn}</div>
     </div>
-    """)
+    """
+    return html
 
 def create_history_card(row):
     # 収益タブ用のリッチな履歴カード
@@ -350,17 +352,16 @@ def create_history_card(row):
     sn = str(row['シリアルナンバー'])
     zone = str(row['エリア'])
     
-    # 種類の判定とデザイン定義
     if "ボーナス" in memo or "差額" in memo:
         job_type = "ボーナス/調整"
         icon = "✨"
-        bg = "#fff8e1" # 薄い黄色
+        bg = "#fff8e1"
         border = "#ffb300"
         sn_disp = memo
     elif "エラー" in memo:
         job_type = "エラー処理"
         icon = "⚠️"
-        bg = "#ffebee" # 薄い赤
+        bg = "#ffebee"
         border = "#ef5350"
         sn_disp = f"SN: {sn[-4:]}"
     else:
@@ -370,45 +371,17 @@ def create_history_card(row):
         border = "#e0e0e0"
         sn_disp = f"SN: {sn[-4:]} ({zone})"
 
-    return textwrap.dedent(f"""
-    <div style="
-        background:{bg}; 
-        border:1px solid {border}; 
-        border-radius:8px; 
-        padding:10px 14px; 
-        margin-bottom:8px; 
-        display:flex; 
-        align-items:center;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
-        
-        <div style="font-size:24px; margin-right:12px;">{icon}</div>
-        
-        <div style="flex-grow:1;">
-            <div style="font-size:13px; font-weight:bold; color:#424242;">{job_type}</div>
-            <div style="font-size:11px; color:#757575;">{comp_date} | {sn_disp}</div>
-        </div>
-        
-        <div style="text-align:right;">
-            <div style="font-size:16px; font-weight:900; color:#212121;">¥{amount}</div>
-        </div>
-    </div>
-    """)
+    # 修正点: HTMLを1行にまとめて記述し、インデント問題を回避
+    html = f"""<div style="background:{bg}; border:1px solid {border}; border-radius:8px; padding:10px 14px; margin-bottom:8px; display:flex; align-items:center; box-shadow: 0 1px 2px rgba(0,0,0,0.05);"><div style="font-size:24px; margin-right:12px;">{icon}</div><div style="flex-grow:1;"><div style="font-size:13px; font-weight:bold; color:#424242;">{job_type}</div><div style="font-size:11px; color:#757575;">{comp_date} | {sn_disp}</div></div><div style="text-align:right;"><div style="font-size:16px; font-weight:900; color:#212121;">¥{amount}</div></div></div>"""
+    
+    return html
 
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V27", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V28", page_icon="⚡", layout="wide")
     
-    # ▼ ヘッダー ▼
-    st.markdown("""
-        <div style='display: flex; align-items: center; border-bottom: 2px solid #ff7043; padding-bottom: 10px; margin-bottom: 20px;'>
-            <div style='font-size: 40px; margin-right: 15px;'>⚡</div>
-            <div>
-                <h1 style='margin: 0; padding: 0; font-size: 32px; color: #333; font-family: sans-serif; letter-spacing: -1px;'>Battery Manager</h1>
-                <div style='font-size: 14px; color: #757575;'>Profit Optimization & Inventory Control <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V27</span></div>
-            </div>
-        </div>
-    """, unsafe_allow_html=True)
-    # ▲ ここまで ▲
+    # ヘッダー (インデント対策済み)
+    st.markdown("""<div style='display: flex; align-items: center; border-bottom: 2px solid #ff7043; padding-bottom: 10px; margin-bottom: 20px;'><div style='font-size: 40px; margin-right: 15px;'>⚡</div><div><h1 style='margin: 0; padding: 0; font-size: 32px; color: #333; font-family: sans-serif; letter-spacing: -1px;'>Battery Manager</h1><div style='font-size: 14px; color: #757575;'>Profit Optimization & Inventory Control <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V28</span></div></div></div>""", unsafe_allow_html=True)
 
     st.markdown("<style>.stSlider{padding-top:1rem;}</style>", unsafe_allow_html=True)
     today = get_today_jst()
@@ -427,23 +400,21 @@ def main():
         df_hist = pd.DataFrame()
 
     week_earnings = 0
-    last_week_earnings = 0 # V27: 先週比用
+    last_week_earnings = 0
     week_count = 0
     next_bonus_at = 20
     
     if not df_hist.empty:
         start_of_week = today - datetime.timedelta(days=today.weekday())
-        last_week_start = start_of_week - datetime.timedelta(days=7) # V27
+        last_week_start = start_of_week - datetime.timedelta(days=7)
         
         df_hist['comp_date'] = pd.to_datetime(df_hist['完了日'], errors='coerce')
         
-        # 今週データ
         w_df = df_hist[
             (df_hist['comp_date'].dt.date >= start_of_week) & 
             (df_hist['ステータス'] == '補充済')
         ].copy()
         
-        # 先週データ (V27)
         lw_df = df_hist[
             (df_hist['comp_date'].dt.date >= last_week_start) & 
             (df_hist['comp_date'].dt.date < start_of_week) & 
@@ -453,7 +424,7 @@ def main():
         count_mask = w_df.apply(lambda x: 'ボーナス' not in str(x['備考']), axis=1)
         week_count = len(w_df[count_mask])
         week_earnings = int(w_df['金額'].sum())
-        last_week_earnings = int(lw_df['金額'].sum()) # V27
+        last_week_earnings = int(lw_df['金額'].sum())
         
         if week_count < 20: next_bonus_at = 20
         elif week_count < 50: next_bonus_at = 50
@@ -475,7 +446,7 @@ def main():
     # 1. ホーム
     with tab1:
         c1, c2, c3 = st.columns(3)
-        c1.metric("報酬", f"¥ {week_earnings:,}", delta=f"{week_earnings - last_week_earnings:,} 円 (先週比)") # V27 delta追加
+        c1.metric("報酬", f"¥ {week_earnings:,}", delta=f"{week_earnings - last_week_earnings:,} 円 (先週比)")
         c2.metric("本数", f"{week_count} 本")
         c3.metric("現在ボナ", f"+{cur_bonus}円/本")
         st.divider()
@@ -598,7 +569,7 @@ def main():
         if not df_inv.empty:
             st.dataframe(df_inv[['保有開始日', 'シリアルナンバー']], use_container_width=True)
 
-    # 4. 収益 (V27: 履歴カード化 & 先週比)
+    # 4. 収益
     with tab4:
         st.metric("今週", f"¥{week_earnings:,}", delta=f"{week_earnings - last_week_earnings:,} 円 (先週比)")
         
@@ -633,7 +604,6 @@ def main():
                 st.divider()
                 st.subheader("📊 履歴タイムライン")
                 
-                # 直近の履歴をカード表示 (最大30件)
                 recent_history = df_wk.sort_values('date', ascending=False).head(30)
                 for _, row in recent_history.iterrows():
                     st.markdown(create_history_card(row), unsafe_allow_html=True)
@@ -643,11 +613,11 @@ def main():
                 
                 chart_data = weekly_agg.sort_values('week_start', ascending=True)
                 base = alt.Chart(chart_data).encode(x=alt.X('Label', sort=None, title='週'))
-                bar = base.mark_bar(color='#ffcc80').encode( # 薄いオレンジ
+                bar = base.mark_bar(color='#ffcc80').encode(
                     y=alt.Y('total_amount', title='金額', axis=alt.Axis(titleColor='#ff7043')),
                     tooltip=['Label', 'total_amount', 'count']
                 )
-                line = base.mark_line(color='#ff7043', strokeWidth=3).encode( # 濃いオレンジ
+                line = base.mark_line(color='#ff7043', strokeWidth=3).encode(
                     y=alt.Y('count', title='本数', axis=alt.Axis(titleColor='#ff7043'))
                 )
                 points = base.mark_circle(color='#ff7043', size=60).encode(
