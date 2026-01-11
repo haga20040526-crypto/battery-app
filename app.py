@@ -129,6 +129,7 @@ def get_database():
 
 def get_active_inventory(df_all):
     if df_all.empty or 'ステータス' not in df_all.columns: return pd.DataFrame()
+    # 修正: 在庫一覧には「在庫」のみ表示（出庫中は作業中扱いのため在庫リストには出さない運用が一般的だが、必要ならここも変える）
     df = df_all[df_all['ステータス'] == '在庫'].copy()
     if not df.empty:
         df = df.sort_values(by=['保有開始日'], ascending=[True])
@@ -152,7 +153,8 @@ def register_new_inventory(data_list):
     
     current_active_serials = set()
     if not df.empty and 'ステータス' in df.columns:
-        active_df = df[df['ステータス'].astype(str).str.strip() == '在庫']
+        # 重複チェック対象: 在庫または出庫中のものは新規登録させない
+        active_df = df[df['ステータス'].astype(str).str.strip().isin(['在庫', '出庫中'])]
         current_active_serials = set(active_df['シリアルナンバー'].astype(str).tolist())
     
     headers = sheet.row_values(1)
@@ -259,11 +261,16 @@ def update_status_bulk(target_serials, new_status, complete_date=None, zone="", 
     target_set = set(str(s) for s in target_serials)
     comp_str = sanitize_for_json(complete_date)
     safe_price = int(price)
+    
+    # ★修正箇所: 「在庫」または「出庫中」なら補充OKとする
+    permitted_statuses = ['在庫', '出庫中']
 
     for i, row in enumerate(all_records):
         s = str(row.get('シリアルナンバー', ''))
         st_val = str(row.get('ステータス', '')).strip()
-        if st_val == '在庫' and s in target_set:
+        
+        # 修正: 許可されたステータスに含まれていれば更新対象
+        if st_val in permitted_statuses and s in target_set:
             r = i + 2
             cells.append(gspread.Cell(r, col_status, new_status))
             cells.append(gspread.Cell(r, col_end, comp_str))
@@ -317,6 +324,10 @@ def create_card(row, today):
         c, bg, st_t, bd = "#1565c0", "#e3f2fd", "✅ 完了", "#2196f3"
         date_label = f"完了: {s_str}"
         main_text = "補充済"
+    elif status == '出庫中':
+        c, bg, st_t, bd = "#f57c00", "#fff3e0", "🚚 出庫中", "#ff9800"
+        date_label = f"取得: {s_str}"
+        main_text = last4
     elif status == '不明' or '削除' in status or 'エラー' in status:
         c, bg, st_t, bd = "#757575", "#f5f5f5", "🚫 除外", "#bdbdbd"
         date_label = "-"
@@ -369,16 +380,15 @@ def create_history_card(row):
         border = "#e0e0e0"
         sn_disp = f"SN: {sn[-4:]} ({zone})"
 
-    # HTMLインデント問題を回避した一行書き
     html = f"""<div style="background:{bg}; border:1px solid {border}; border-radius:8px; padding:10px 14px; margin-bottom:8px; display:flex; align-items:center; box-shadow: 0 1px 2px rgba(0,0,0,0.05);"><div style="font-size:24px; margin-right:12px;">{icon}</div><div style="flex-grow:1;"><div style="font-size:13px; font-weight:bold; color:#424242;">{job_type}</div><div style="font-size:11px; color:#757575;">{comp_date} | {sn_disp}</div></div><div style="text-align:right;"><div style="font-size:16px; font-weight:900; color:#212121;">¥{amount}</div></div></div>"""
     return html
 
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V29", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V29+", page_icon="⚡", layout="wide")
     
     # ヘッダー
-    st.markdown("""<div style='display: flex; align-items: center; border-bottom: 2px solid #ff7043; padding-bottom: 10px; margin-bottom: 20px;'><div style='font-size: 40px; margin-right: 15px;'>⚡</div><div><h1 style='margin: 0; padding: 0; font-size: 32px; color: #333; font-family: sans-serif; letter-spacing: -1px;'>Battery Manager</h1><div style='font-size: 14px; color: #757575;'>Profit Optimization & Inventory Control <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V29</span></div></div></div>""", unsafe_allow_html=True)
+    st.markdown("""<div style='display: flex; align-items: center; border-bottom: 2px solid #ff7043; padding-bottom: 10px; margin-bottom: 20px;'><div style='font-size: 40px; margin-right: 15px;'>⚡</div><div><h1 style='margin: 0; padding: 0; font-size: 32px; color: #333; font-family: sans-serif; letter-spacing: -1px;'>Battery Manager</h1><div style='font-size: 14px; color: #757575;'>Profit Optimization & Inventory Control <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V29+</span></div></div></div>""", unsafe_allow_html=True)
 
     st.markdown("<style>.stSlider{padding-top:1rem;}</style>", unsafe_allow_html=True)
     today = get_today_jst()
@@ -483,8 +493,12 @@ def main():
                     st.info(f"{len(sns)}件 検出")
                     if st.button("補充確定", type="primary", use_container_width=True):
                         base = ZONES[zone]
+                        # ここでステータス更新関数を呼び出し
                         cnt = update_status_bulk(sns, "補充済", date_done, zone, base)
-                        st.success(f"{cnt}件 更新しました")
+                        if cnt > 0:
+                            st.success(f"{cnt}件 更新しました")
+                        else:
+                            st.warning("更新できませんでした。在庫または出庫中のステータスか確認してください。")
                         import time
                         time.sleep(1)
                         st.rerun()
@@ -601,7 +615,6 @@ def main():
                 st.divider()
                 st.subheader("📊 履歴タイムライン")
                 
-                # V29: 並び順修正 (日付降順 > インデックス降順)
                 df_wk['orig_index'] = df_wk.index
                 recent_history = df_wk.sort_values(by=['date', 'orig_index'], ascending=[False, False]).head(30)
                 
