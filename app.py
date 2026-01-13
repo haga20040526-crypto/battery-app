@@ -3,7 +3,6 @@ import datetime
 import re
 import time
 import sys
-from evdev import ecodes
 from flask import Flask, render_template, request, jsonify
 import gspread
 from google.oauth2.service_account import Credentials
