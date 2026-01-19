@@ -150,7 +150,36 @@ def get_vol_bonus(count):
     elif count >= 20: return 5
     else: return 0
 
-# --- 分析モジュール (Analytics Logic) ---
+# --- 分析モジュール (Analytics Logic V1.4) ---
+
+def calculate_kpi_for_period(df_subset):
+    """指定期間のKPIを計算するヘルパー関数"""
+    if len(df_subset) == 0:
+        return {"ebr": 0, "rpd": 0, "ahd": 0, "count": 0, "revenue": 0, "avg_price": 0}
+    
+    # Early Bonus Rate
+    early_count = len(df_subset[df_subset['holding_days'] <= 3])
+    ebr = (early_count / len(df_subset)) * 100
+    
+    # RPD
+    total_rev = df_subset['金額'].sum()
+    total_hold_days = df_subset['holding_days'].sum()
+    rpd = total_rev / total_hold_days if total_hold_days > 0 else 0
+    
+    # Avg Holding Days
+    ahd = df_subset['holding_days'].mean()
+    
+    # Avg Price (APU)
+    avg_price = df_subset['金額'].mean()
+
+    return {
+        "ebr": ebr, 
+        "rpd": rpd, 
+        "ahd": ahd, 
+        "count": len(df_subset), 
+        "revenue": total_rev,
+        "avg_price": avg_price
+    }
 
 def calculate_analytics_logic(df):
     """
@@ -162,49 +191,47 @@ def calculate_analytics_logic(df):
     df['completed_at'] = pd.to_datetime(df['完了日'], errors='coerce')
     df['acquired_at'] = pd.to_datetime(df['保有開始日'], errors='coerce')
     
-    # 完了済みデータの抽出
+    # 全完了データ
     completed_df = df[df['ステータス'] == '補充済'].copy()
     completed_df = completed_df.dropna(subset=['completed_at', 'acquired_at'])
     completed_df['holding_days'] = (completed_df['completed_at'] - completed_df['acquired_at']).dt.days
-
-    # --- 1. KPI計算 ---
-    # Early Bonus Rate (直近30日)
-    today = datetime.datetime.now()
-    month_ago = today - datetime.timedelta(days=30)
-    recent_df = completed_df[completed_df['completed_at'] >= month_ago]
     
-    early_rate = 0
-    if len(recent_df) > 0:
-        early_count = len(recent_df[recent_df['holding_days'] <= 3])
-        early_rate = (early_count / len(recent_df)) * 100
+    # --- 1. 戦況スコアカード (Comparison vs Last Week) ---
+    today = datetime.datetime.now()
+    
+    # 期間定義: Current (直近7日), Previous (その前の7日)
+    current_start = today - datetime.timedelta(days=7)
+    previous_start = today - datetime.timedelta(days=14)
+    
+    current_df = completed_df[completed_df['completed_at'] >= current_start]
+    prev_df = completed_df[(completed_df['completed_at'] >= previous_start) & (completed_df['completed_at'] < current_start)]
+    
+    cur_metrics = calculate_kpi_for_period(current_df)
+    prev_metrics = calculate_kpi_for_period(prev_df)
+    
+    # --- 2. 戦術指標 (Tactical) ---
+    # I/O Balance: 直近7日の (入庫数 / 出庫数)
+    # 入庫数 (acquired_at が直近7日)
+    input_df = df[df['acquired_at'] >= current_start]
+    input_count = len(input_df)
+    output_count = cur_metrics['count']
+    io_balance = (input_count / output_count) if output_count > 0 else 0
+    
+    # --- 3. サイクル分布 (Density Curve用生データ) ---
+    # 直近30日のデータを使用
+    month_start = today - datetime.timedelta(days=30)
+    month_df = completed_df[completed_df['completed_at'] >= month_start].copy()
+    # ヒストグラム + 密度推定のために、保有日数のリストをそのまま保存
+    raw_holding_days = month_df['holding_days'].tolist()
 
-    # RPD (Revenue Per Day)
-    total_rev = completed_df['金額'].sum()
-    total_days = completed_df['holding_days'].sum()
-    # 0日保有も1日とみなすか、そのまま計算するか。ここでは0除算回避のみ。
-    if total_days == 0: total_days = 1 
-    rpd = total_rev / total_days
+    # --- 4. 行動トレンド (Heatmap) ---
+    # 直近1ヶ月の曜日別活動量
+    month_df['weekday'] = month_df['completed_at'].dt.day_name()
+    # 曜日ごとのカウント
+    heatmap_series = month_df.groupby('weekday').size()
+    heatmap_data = [{'weekday': wd, 'count': int(count)} for wd, count in heatmap_series.items()]
 
-    # Avg Holding Days
-    avg_holding = completed_df['holding_days'].mean() if len(completed_df) > 0 else 0
-
-    # --- 2. ヒストグラムデータ ---
-    # Zone A(0-3), B(4-22), C(23+)
-    hist_counts = completed_df['holding_days'].value_counts().sort_index().to_dict()
-    # キーを文字列化してJSON保存可能に
-    hist_data = {str(k): int(v) for k, v in hist_counts.items()}
-
-    # --- 3. ヒートマップデータ (曜日別活動量) ---
-    # 時間データがないため、曜日ごとの完了数で代用
-    completed_df['weekday'] = completed_df['completed_at'].dt.day_name()
-    # 時間帯はダミー(Day)とするか、将来の拡張に備える
-    completed_df['time_zone'] = 'Day' 
-    heatmap_series = completed_df.groupby(['weekday', 'time_zone']).size()
-    heatmap_data = []
-    for (wd, tz), count in heatmap_series.items():
-        heatmap_data.append({'weekday': wd, 'time_zone': tz, 'count': int(count)})
-
-    # --- 4. 推移分析 (週次 平均保有日数) ---
+    # --- 5. 推移分析 (週次) ---
     three_months_ago = today - datetime.timedelta(days=90)
     trend_df = completed_df[completed_df['completed_at'] >= three_months_ago].copy()
     trend_df['week'] = trend_df['completed_at'].dt.to_period('W').astype(str)
@@ -212,12 +239,16 @@ def calculate_analytics_logic(df):
     trend_data = [{'week': w, 'avg_days': round(d, 2)} for w, d in trend_series.items()]
 
     return {
-        "kpi": {
-            "early_bonus_rate": round(early_rate, 1),
-            "rpd": round(rpd, 1),
-            "avg_holding_days": round(avg_holding, 1)
+        "scorecard": {
+            "current": cur_metrics,
+            "previous": prev_metrics
         },
-        "histogram": hist_data,
+        "tactical": {
+            "io_balance": round(io_balance, 2),
+            "input_count": input_count,
+            "output_count": output_count
+        },
+        "histogram_raw": raw_holding_days, # 生データ
         "heatmap": heatmap_data,
         "trend": trend_data,
         "updated_at": today.strftime('%Y-%m-%d %H:%M:%S')
@@ -228,8 +259,6 @@ def update_analytics_background():
     バックグラウンドスレッドでKPIを再計算してJSONに保存
     """
     def task():
-        # DBから最新データを取得（スレッド内で安全に行うため再取得）
-        # ※StreamlitのSecretsはスレッド内でも参照可能
         try:
             df = get_database()
             if df.empty: return
@@ -237,7 +266,6 @@ def update_analytics_background():
             data = calculate_analytics_logic(df)
             with open(ANALYTICS_CACHE_FILE, 'w') as f:
                 json.dump(data, f)
-            # print("Analytics updated in background.")
         except Exception as e:
             print(f"Background update failed: {e}")
 
@@ -253,7 +281,7 @@ def load_analytics_cache():
     except:
         return None
 
-# --- 書き込み・計算ロジック (トリガー追加版) ---
+# --- 書き込み・計算ロジック ---
 
 def register_new_inventory(data_list):
     client = get_connection()
@@ -282,7 +310,6 @@ def register_new_inventory(data_list):
     if rows:
         try: 
             sheet.append_rows(rows)
-            # ★トリガー: 分析データのバックグラウンド更新
             update_analytics_background()
         except: return 0, 0
     return len(rows), skipped
@@ -305,7 +332,6 @@ def register_past_bulk(date_obj, count, total_amount, zone, memo="", job_id=""):
         rows.append(row)
     if rows: 
         sheet.append_rows(rows)
-        # ★トリガー: 分析データのバックグラウンド更新
         update_analytics_background()
 
     return len(rows)
@@ -401,7 +427,6 @@ def update_status_bulk(target_serials, new_status, complete_date=None, zone="", 
     
     if updated > 0 and new_status == '補充済' and complete_date:
         recalc_weekly_revenue(sheet, complete_date)
-        # ★トリガー: 分析データのバックグラウンド更新
         update_analytics_background()
 
     return updated
@@ -480,7 +505,6 @@ def create_history_card(row):
         border = "#e0e0e0"
         sn_disp = f"SN: {sn[-4:]} ({zone})"
         if job_id:
-            # ジョブIDを表示
             sn_disp += f" <span style='color:#1565c0; font-size:10px;'>[{job_id}]</span>"
 
     html = f"""<div style="background:{bg}; border:1px solid {border}; border-radius:8px; padding:10px 14px; margin-bottom:8px; display:flex; align-items:center; box-shadow: 0 1px 2px rgba(0,0,0,0.05);"><div style="font-size:24px; margin-right:12px;">{icon}</div><div style="flex-grow:1;"><div style="font-size:13px; font-weight:bold; color:#424242;">{job_type}</div><div style="font-size:11px; color:#757575;">{comp_date} | {sn_disp}</div></div><div style="text-align:right;"><div style="font-size:16px; font-weight:900; color:#212121;">¥{amount}</div></div></div>"""
@@ -488,10 +512,10 @@ def create_history_card(row):
 
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V32", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V33", page_icon="⚡", layout="wide")
     
     # ヘッダー
-    st.markdown("""<div style='display: flex; align-items: center; border-bottom: 2px solid #ff7043; padding-bottom: 10px; margin-bottom: 20px;'><div style='font-size: 40px; margin-right: 15px;'>⚡</div><div><h1 style='margin: 0; padding: 0; font-size: 32px; color: #333; font-family: sans-serif; letter-spacing: -1px;'>Battery Manager</h1><div style='font-size: 14px; color: #757575;'>Recorder to Strategist <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V32</span></div></div></div>""", unsafe_allow_html=True)
+    st.markdown("""<div style='display: flex; align-items: center; border-bottom: 2px solid #ff7043; padding-bottom: 10px; margin-bottom: 20px;'><div style='font-size: 40px; margin-right: 15px;'>⚡</div><div><h1 style='margin: 0; padding: 0; font-size: 32px; color: #333; font-family: sans-serif; letter-spacing: -1px;'>Battery Manager</h1><div style='font-size: 14px; color: #757575;'>Pure Instrument <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V33</span></div></div></div>""", unsafe_allow_html=True)
 
     st.markdown("<style>.stSlider{padding-top:1rem;}</style>", unsafe_allow_html=True)
     today = get_today_jst()
@@ -596,7 +620,6 @@ def main():
                     st.info(f"{len(sns)}件 検出")
                     if st.button("補充確定", type="primary", use_container_width=True):
                         base = ZONES[zone]
-                        # 自動ジョブID生成
                         now_str = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
                         auto_job_id = f"J{now_str}"
                         
@@ -698,10 +721,8 @@ def main():
                 p_memo = st.text_input("備考", placeholder="ボーナスなど")
                 
                 if st.form_submit_button("登録"):
-                    # 自動ジョブID生成
                     now_str = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
                     auto_job_id = f"J{now_str}"
-                    
                     reg_cnt = register_past_bulk(p_date, p_count, p_amount, p_zone, p_memo, job_id=auto_job_id)
                     st.success(f"{reg_cnt}行 登録完了 (ID: {auto_job_id})")
                     time.sleep(1)
@@ -808,86 +829,127 @@ def main():
 
     # 6. 分析 (Analytics)
     with tab6:
-        st.subheader("📊 Analytics: Strategist Mode")
+        st.subheader("📊 Analytics: Pure Instrument")
         
         # キャッシュからデータ読み込み
         analytics_data = load_analytics_cache()
         
         if not analytics_data:
-            st.info("現在データを集計中です。何らかのジョブ（補充・登録など）を行うと初回計算が走ります。")
-            if st.button("今すぐ強制集計 (少し時間がかかります)"):
+            st.info("データ集計待ち... 任意のジョブを実行すると初回計算が始まります。")
+            if st.button("強制リフレッシュ"):
                 update_analytics_background()
-                st.success("バックグラウンド集計を開始しました。ページをリロードしてください。")
+                st.success("計算開始。リロードしてください。")
         else:
-            # --- Section 1: KPI Scorecard ---
-            st.markdown("#### 1. The Head-Up Display")
-            kpi = analytics_data.get('kpi', {})
+            sc = analytics_data.get('scorecard', {})
+            cur = sc.get('current', {})
+            prev = sc.get('previous', {})
+            tactical = analytics_data.get('tactical', {})
+
+            # --- Section 1: Head-Up Display (Comparison) ---
+            st.markdown("#### 1. The Head-Up Display (vs Last Week)")
             c_k1, c_k2, c_k3 = st.columns(3)
             
             # Early Bonus Rate
-            ebr = kpi.get('early_bonus_rate', 0)
+            ebr_cur = cur.get('ebr', 0)
+            ebr_prev = prev.get('ebr', 0)
             c_k1.metric(
-                label="🏆 Early Bonus Rate",
-                value=f"{ebr}%",
-                delta="Target: 80%",
-                delta_color="normal" if ebr >= 80 else "inverse"
+                label="🏆 Early Bonus Rate (勝率)",
+                value=f"{ebr_cur:.1f}%",
+                delta=f"{ebr_cur - ebr_prev:.1f}% (vs LW)"
             )
             # RPD
-            rpd = kpi.get('rpd', 0)
+            rpd_cur = cur.get('rpd', 0)
+            rpd_prev = prev.get('rpd', 0)
             c_k2.metric(
                 label="💰 RPD (資産回転速度)",
-                value=f"¥{rpd}/day",
-                help="1日あたり何円の価値を生んでいるか"
+                value=f"¥{int(rpd_cur)}/day",
+                delta=f"{int(rpd_cur - rpd_prev)} (vs LW)"
             )
             # Avg Holding Days
-            ahd = kpi.get('avg_holding_days', 0)
+            ahd_cur = cur.get('ahd', 0)
+            ahd_prev = prev.get('ahd', 0)
             c_k3.metric(
-                label="⚡ Avg. Holding Days",
-                value=f"{ahd} days",
-                delta="Limit: 3.0 days",
-                delta_color="inverse"
+                label="⚡ Avg. Holding Days (鮮度)",
+                value=f"{ahd_cur:.1f} days",
+                delta=f"{ahd_cur - ahd_prev:.1f} (vs LW)",
+                delta_color="inverse" # 増える＝悪化なので色反転
             )
             st.divider()
 
-            # --- Section 2: Histogram ---
-            st.markdown("#### 2. Cycle Histogram (在庫サイクル分布)")
-            hist_d = analytics_data.get('histogram', {})
-            if hist_d:
-                hist_df = pd.DataFrame(list(hist_d.items()), columns=['days_str', 'count'])
-                hist_df['days'] = pd.to_numeric(hist_df['days_str'])
-                hist_df['zone'] = hist_df['days'].apply(
-                    lambda x: '🟢 Zone A (Ideal)' if x <= 3 else ('🟡 Zone B (Normal)' if x <= 22 else '🔴 Zone C (Danger)')
+            # --- Section 2: Tactical Metrics ---
+            st.markdown("#### 2. Tactical Metrics")
+            t_c1, t_c2 = st.columns(2)
+            
+            # APU (Avg Price Unit)
+            apu = cur.get('avg_price', 0)
+            apu_delta = apu - 70 # エリアD基準(70円)との乖離
+            t_c1.metric(
+                label="💎 APU (平均単価)",
+                value=f"¥{int(apu)}",
+                delta=f"{int(apu_delta)} vs Std(¥70)"
+            )
+            
+            # I/O Balance
+            io = tactical.get('io_balance', 0)
+            t_c2.metric(
+                label="⚖️ I/O Balance (入庫/出庫)",
+                value=f"{io:.2f}",
+                delta="Overstock" if io > 1.1 else ("Drain" if io < 0.9 else "Balanced"),
+                delta_color="off"
+            )
+            st.caption(f"Input: {tactical.get('input_count')} / Output: {tactical.get('output_count')} (Last 7 Days)")
+            st.divider()
+
+            # --- Section 3: Cycle Histogram + Density ---
+            st.markdown("#### 3. Cycle Distribution (Histogram + Density)")
+            raw_days = analytics_data.get('histogram_raw', [])
+            if raw_days:
+                hist_source = pd.DataFrame({'days': raw_days})
+                hist_source['zone'] = hist_source['days'].apply(
+                    lambda x: 'A(0-3)' if x <= 3 else ('B(4-22)' if x <= 22 else 'C(23+)')
+                )
+
+                base = alt.Chart(hist_source).encode(x=alt.X('days', title='保有日数', bin=alt.Bin(maxbins=30)))
+
+                # 1. Histogram
+                bars = base.mark_bar(opacity=0.6).encode(
+                    y=alt.Y('count()', title='本数'),
+                    color=alt.Color('zone', scale=alt.Scale(range=['#4caf50', '#ffeb3b', '#f44336']))
                 )
                 
-                chart_hist = alt.Chart(hist_df).mark_bar().encode(
-                    x=alt.X('days', title='保有日数'),
-                    y=alt.Y('count', title='本数'),
-                    color=alt.Color('zone', scale=alt.Scale(
-                        domain=['🟢 Zone A (Ideal)', '🟡 Zone B (Normal)', '🔴 Zone C (Danger)'],
-                        range=['#4caf50', '#ffeb3b', '#f44336']
-                    )),
-                    tooltip=['days', 'count', 'zone']
-                ).properties(height=250)
-                st.altair_chart(chart_hist, use_container_width=True)
+                # 2. Density Curve
+                density = alt.Chart(hist_source).transform_density(
+                    'days',
+                    as_=['days', 'density'],
+                ).mark_line(color='white', strokeWidth=3).encode(
+                    x='days:Q',
+                    y=alt.Y('density:Q', axis=None) # 軸は隠す
+                )
+                
+                # Peak Indicator logic (Altair上では難しいので簡易的に平均線を表示)
+                rule = alt.Chart(hist_source).mark_rule(color='red', strokeDash=[5,5]).encode(
+                    x='mean(days):Q'
+                )
+
+                st.altair_chart((bars + density + rule).resolve_scale(y='independent'), use_container_width=True)
             
-            # --- Section 3: Heatmap ---
-            st.markdown("#### 3. Activity Heatmap (曜日別活動量)")
+            # --- Section 4: Activity Heatmap ---
+            st.markdown("#### 4. Activity Heatmap (Past 30 Days)")
             hm_d = analytics_data.get('heatmap', [])
             if hm_d:
                 hm_df = pd.DataFrame(hm_d)
                 days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
                 
                 chart_heat = alt.Chart(hm_df).mark_rect().encode(
-                    x=alt.X('time_zone', title='区分 (現在Dayのみ)'),
-                    y=alt.Y('weekday', sort=days_order, title='曜日'),
-                    color=alt.Color('count', title='完了数', scale=alt.Scale(scheme='orangered')),
+                    x=alt.X('weekday', sort=days_order, title=None),
+                    y=alt.Y('count', title='完了本数'), # ヒートマップ的表現だが棒の高さも利用
+                    color=alt.Color('count', scale=alt.Scale(scheme='inferno'), title='Intensity'),
                     tooltip=['weekday', 'count']
-                ).properties(height=300)
+                ).properties(height=200)
                 st.altair_chart(chart_heat, use_container_width=True)
-                st.caption("※時間データがないため、曜日ごとの総量で表示しています。")
 
-            # --- Section 4: Trend ---
-            st.markdown("#### 4. Efficiency Trend (週次 平均保有日数)")
+            # --- Section 5: Trend ---
+            st.markdown("#### 5. Efficiency Trend (90 Days)")
             tr_d = analytics_data.get('trend', [])
             if tr_d:
                 tr_df = pd.DataFrame(tr_d)
