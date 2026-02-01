@@ -360,20 +360,17 @@ def update_status_bulk(target_serials, new_status, complete_date=None, zone="", 
     cells = []
     target_set = set(str(s) for s in target_serials)
     
-    # --- Strict Validation Start ---
-    # まず全レコードからターゲットSNの現在のステータスを特定
+    # --- Strict Validation ---
     sn_status_map = {}
     for row in all_records:
         r_sn = str(row.get('シリアルナンバー', ''))
         if r_sn in target_set:
             sn_status_map[r_sn] = str(row.get('ステータス', '')).strip()
     
-    # 検証1: DBに存在しないSNがあるか
     missing_sns = target_set - set(sn_status_map.keys())
     if missing_sns:
         return {"error": True, "msg": f"未登録のバッテリーが含まれています: {', '.join(missing_sns)}"}
     
-    # 検証2: ステータスが対象外(在庫/出庫中以外)のものがあるか
     permitted_statuses = ['在庫', '出庫中']
     invalid_sns = []
     for sn, st_val in sn_status_map.items():
@@ -382,12 +379,10 @@ def update_status_bulk(target_serials, new_status, complete_date=None, zone="", 
             
     if invalid_sns:
         return {"error": True, "msg": f"対象外ステータスのバッテリーが含まれています: {', '.join(invalid_sns)}"}
-    # --- Strict Validation End ---
 
     comp_str = sanitize_for_json(complete_date)
     safe_price = int(price)
 
-    # バリデーション通過後、更新処理
     updated = 0
     for i, row in enumerate(all_records):
         s = str(row.get('シリアルナンバー', ''))
@@ -460,10 +455,10 @@ def create_card(row, today):
 
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V34", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V35", page_icon="⚡", layout="wide")
     
     # ヘッダー
-    st.markdown("""<div style='display: flex; align-items: center; border-bottom: 2px solid #ff7043; padding-bottom: 10px; margin-bottom: 20px;'><div style='font-size: 40px; margin-right: 15px;'>⚡</div><div><h1 style='margin: 0; padding: 0; font-size: 32px; color: #333; font-family: sans-serif; letter-spacing: -1px;'>Battery Manager</h1><div style='font-size: 14px; color: #757575;'>Pure Instrument <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V34 (Strict & JobView)</span></div></div></div>""", unsafe_allow_html=True)
+    st.markdown("""<div style='display: flex; align-items: center; border-bottom: 2px solid #ff7043; padding-bottom: 10px; margin-bottom: 20px;'><div style='font-size: 40px; margin-right: 15px;'>⚡</div><div><h1 style='margin: 0; padding: 0; font-size: 32px; color: #333; font-family: sans-serif; letter-spacing: -1px;'>Battery Manager</h1><div style='font-size: 14px; color: #757575;'>Pure Instrument <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V35 (Sorted History)</span></div></div></div>""", unsafe_allow_html=True)
 
     st.markdown("<style>.stSlider{padding-top:1rem;}</style>", unsafe_allow_html=True)
     today = get_today_jst()
@@ -571,7 +566,6 @@ def main():
                         now_str = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
                         auto_job_id = f"J{now_str}"
                         
-                        # V34: エラーハンドリング追加
                         res = update_status_bulk(sns, "補充済", date_done, zone, base, job_id=auto_job_id)
                         if isinstance(res, dict) and res.get('error'):
                             st.error(f"⛔️ エラー: {res['msg']}")
@@ -684,29 +678,31 @@ def main():
         if not df_hist.empty:
             df_done = df_hist[df_hist['ステータス'] == '補充済'].copy()
             if not df_done.empty:
-                # JobIDでグルーピング（JobIDがないものは空文字として扱う）
-                # 並び順: JobIDの降順（時系列）
+                # JobIDのないものは空文字に置換
                 df_done['ジョブID'] = df_done['ジョブID'].fillna('')
-                # JobIDがない場合は日付で代用グルーピングするためのキー作成
+                # グルーピングキー作成: JobIDがあればそれ、なければ"NO-JOB-{完了日}"
                 df_done['group_key'] = df_done.apply(lambda x: x['ジョブID'] if x['ジョブID'] else f"NO-JOB-{x['完了日']}", axis=1)
                 
-                # グループ化して集計
                 jobs = []
                 grouped = df_done.groupby('group_key')
                 
                 for key, group in grouped:
                     first_row = group.iloc[0]
                     job_id = first_row['ジョブID']
-                    date_val = first_row['完了日']
+                    date_val = str(first_row['完了日'])
                     area_val = first_row['エリア']
                     total_amt = group['金額'].sum()
                     count = len(group)
-                    
-                    # SNリスト
                     sn_list = group['シリアルナンバー'].tolist()
                     
+                    # ソート用ロジック:
+                    # 1. JobIDがある (1) vs ない (0)
+                    # 2. 値の大きさ（JobID文字列 or 日付文字列）
+                    has_id = 1 if job_id else 0
+                    sort_val = job_id if job_id else date_val
+                    
                     jobs.append({
-                        'key': key, # ソート用
+                        'sort_key': (has_id, sort_val),
                         'job_id': job_id,
                         'date': date_val,
                         'area': area_val,
@@ -715,14 +711,12 @@ def main():
                         'sns': sn_list
                     })
                 
-                # ソート (Keyの降順 = 新しい順)
-                jobs.sort(key=lambda x: x['key'], reverse=True)
+                # ソート: (JobID有無(1/0), 文字列) のタプルで降順ソート
+                # 結果: JobIDあり(最新順) -> JobIDなし(最新順) の順に並ぶ
+                jobs.sort(key=lambda x: x['sort_key'], reverse=True)
                 
                 for j in jobs:
-                    # カード表示
                     job_label = j['job_id'] if j['job_id'] else "Legacy Job (No ID)"
-                    
-                    # カスタムカードHTML
                     card_html = f"""
                     <div style="background:#ffffff; border:1px solid #e0e0e0; border-radius:8px; padding:12px; margin-bottom:5px; border-left: 5px solid #1565c0;">
                         <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -788,7 +782,6 @@ def main():
                     st.warning("在庫差異あり")
                     with st.expander("詳細"): st.write(ghosts)
                     if st.button("一括「補充エラー」にする"):
-                        # V34: 棚卸しの一括エラー処理もエラーハンドリング対応
                         res = update_status_bulk(ghosts, "補充エラー", today, "", 0, "棚卸検知")
                         if isinstance(res, dict) and res.get('error'):
                             st.error(res['msg'])
