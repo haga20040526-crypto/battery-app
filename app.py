@@ -153,53 +153,33 @@ def get_vol_bonus(count):
 # --- 分析モジュール (Analytics Logic V1.4) ---
 
 def calculate_kpi_for_period(df_subset):
-    """指定期間のKPIを計算するヘルパー関数"""
     if len(df_subset) == 0:
         return {"ebr": 0, "rpd": 0, "ahd": 0, "count": 0, "revenue": 0, "avg_price": 0}
     
-    # Early Bonus Rate
     early_count = len(df_subset[df_subset['holding_days'] <= 3])
     ebr = (early_count / len(df_subset)) * 100
     
-    # RPD
     total_rev = df_subset['金額'].sum()
     total_hold_days = df_subset['holding_days'].sum()
     rpd = total_rev / total_hold_days if total_hold_days > 0 else 0
-    
-    # Avg Holding Days
     ahd = df_subset['holding_days'].mean()
-    
-    # Avg Price (APU)
     avg_price = df_subset['金額'].mean()
 
     return {
-        "ebr": ebr, 
-        "rpd": rpd, 
-        "ahd": ahd, 
-        "count": len(df_subset), 
-        "revenue": total_rev,
-        "avg_price": avg_price
+        "ebr": ebr, "rpd": rpd, "ahd": ahd, 
+        "count": len(df_subset), "revenue": total_rev, "avg_price": avg_price
     }
 
 def calculate_analytics_logic(df):
-    """
-    データフレームから分析用データを計算する（バックグラウンド実行用）
-    """
     if df.empty: return {}
-
-    # 日付変換
     df['completed_at'] = pd.to_datetime(df['完了日'], errors='coerce')
     df['acquired_at'] = pd.to_datetime(df['保有開始日'], errors='coerce')
     
-    # 全完了データ
     completed_df = df[df['ステータス'] == '補充済'].copy()
     completed_df = completed_df.dropna(subset=['completed_at', 'acquired_at'])
     completed_df['holding_days'] = (completed_df['completed_at'] - completed_df['acquired_at']).dt.days
     
-    # --- 1. 戦況スコアカード (Comparison vs Last Week) ---
     today = datetime.datetime.now()
-    
-    # 期間定義: Current (直近7日), Previous (その前の7日)
     current_start = today - datetime.timedelta(days=7)
     previous_start = today - datetime.timedelta(days=14)
     
@@ -209,29 +189,19 @@ def calculate_analytics_logic(df):
     cur_metrics = calculate_kpi_for_period(current_df)
     prev_metrics = calculate_kpi_for_period(prev_df)
     
-    # --- 2. 戦術指標 (Tactical) ---
-    # I/O Balance: 直近7日の (入庫数 / 出庫数)
-    # 入庫数 (acquired_at が直近7日)
     input_df = df[df['acquired_at'] >= current_start]
     input_count = len(input_df)
     output_count = cur_metrics['count']
     io_balance = (input_count / output_count) if output_count > 0 else 0
     
-    # --- 3. サイクル分布 (Density Curve用生データ) ---
-    # 直近30日のデータを使用
     month_start = today - datetime.timedelta(days=30)
     month_df = completed_df[completed_df['completed_at'] >= month_start].copy()
-    # ヒストグラム + 密度推定のために、保有日数のリストをそのまま保存
     raw_holding_days = month_df['holding_days'].tolist()
 
-    # --- 4. 行動トレンド (Heatmap) ---
-    # 直近1ヶ月の曜日別活動量
     month_df['weekday'] = month_df['completed_at'].dt.day_name()
-    # 曜日ごとのカウント
     heatmap_series = month_df.groupby('weekday').size()
     heatmap_data = [{'weekday': wd, 'count': int(count)} for wd, count in heatmap_series.items()]
 
-    # --- 5. 推移分析 (週次) ---
     three_months_ago = today - datetime.timedelta(days=90)
     trend_df = completed_df[completed_df['completed_at'] >= three_months_ago].copy()
     trend_df['week'] = trend_df['completed_at'].dt.to_period('W').astype(str)
@@ -239,36 +209,24 @@ def calculate_analytics_logic(df):
     trend_data = [{'week': w, 'avg_days': round(d, 2)} for w, d in trend_series.items()]
 
     return {
-        "scorecard": {
-            "current": cur_metrics,
-            "previous": prev_metrics
-        },
-        "tactical": {
-            "io_balance": round(io_balance, 2),
-            "input_count": input_count,
-            "output_count": output_count
-        },
-        "histogram_raw": raw_holding_days, # 生データ
+        "scorecard": {"current": cur_metrics, "previous": prev_metrics},
+        "tactical": {"io_balance": round(io_balance, 2), "input_count": input_count, "output_count": output_count},
+        "histogram_raw": raw_holding_days,
         "heatmap": heatmap_data,
         "trend": trend_data,
         "updated_at": today.strftime('%Y-%m-%d %H:%M:%S')
     }
 
 def update_analytics_background():
-    """
-    バックグラウンドスレッドでKPIを再計算してJSONに保存
-    """
     def task():
         try:
             df = get_database()
             if df.empty: return
-            
             data = calculate_analytics_logic(df)
             with open(ANALYTICS_CACHE_FILE, 'w') as f:
                 json.dump(data, f)
         except Exception as e:
             print(f"Background update failed: {e}")
-
     thread = threading.Thread(target=task)
     thread.start()
 
@@ -400,18 +358,40 @@ def update_status_bulk(target_serials, new_status, complete_date=None, zone="", 
     except: return 0
 
     cells = []
-    updated = 0
     target_set = set(str(s) for s in target_serials)
+    
+    # --- Strict Validation Start ---
+    # まず全レコードからターゲットSNの現在のステータスを特定
+    sn_status_map = {}
+    for row in all_records:
+        r_sn = str(row.get('シリアルナンバー', ''))
+        if r_sn in target_set:
+            sn_status_map[r_sn] = str(row.get('ステータス', '')).strip()
+    
+    # 検証1: DBに存在しないSNがあるか
+    missing_sns = target_set - set(sn_status_map.keys())
+    if missing_sns:
+        return {"error": True, "msg": f"未登録のバッテリーが含まれています: {', '.join(missing_sns)}"}
+    
+    # 検証2: ステータスが対象外(在庫/出庫中以外)のものがあるか
+    permitted_statuses = ['在庫', '出庫中']
+    invalid_sns = []
+    for sn, st_val in sn_status_map.items():
+        if st_val not in permitted_statuses:
+            invalid_sns.append(f"{sn}({st_val})")
+            
+    if invalid_sns:
+        return {"error": True, "msg": f"対象外ステータスのバッテリーが含まれています: {', '.join(invalid_sns)}"}
+    # --- Strict Validation End ---
+
     comp_str = sanitize_for_json(complete_date)
     safe_price = int(price)
-    
-    permitted_statuses = ['在庫', '出庫中']
 
+    # バリデーション通過後、更新処理
+    updated = 0
     for i, row in enumerate(all_records):
         s = str(row.get('シリアルナンバー', ''))
-        st_val = str(row.get('ステータス', '')).strip()
-        
-        if st_val in permitted_statuses and s in target_set:
+        if s in target_set:
             r = i + 2
             cells.append(gspread.Cell(r, col_status, new_status))
             cells.append(gspread.Cell(r, col_end, comp_str))
@@ -423,13 +403,13 @@ def update_status_bulk(target_serials, new_status, complete_date=None, zone="", 
             
     if cells:
         try: sheet.update_cells(cells)
-        except: return 0
+        except: return {"error": True, "msg": "DB更新エラー"}
     
     if updated > 0 and new_status == '補充済' and complete_date:
         recalc_weekly_revenue(sheet, complete_date)
         update_analytics_background()
 
-    return updated
+    return {"error": False, "count": updated}
 
 # --- UIパーツ ---
 def create_card(row, today):
@@ -478,44 +458,12 @@ def create_card(row, today):
     """
     return html
 
-def create_history_card(row):
-    comp_date = pd.to_datetime(row['完了日']).strftime('%m/%d')
-    amount = row['金額']
-    memo = str(row['備考'])
-    sn = str(row['シリアルナンバー'])
-    zone = str(row['エリア'])
-    job_id = str(row.get('ジョブID', ''))
-    
-    if "ボーナス" in memo or "差額" in memo:
-        job_type = "ボーナス/調整"
-        icon = "✨"
-        bg = "#fff8e1"
-        border = "#ffb300"
-        sn_disp = memo
-    elif "エラー" in memo:
-        job_type = "エラー処理"
-        icon = "⚠️"
-        bg = "#ffebee"
-        border = "#ef5350"
-        sn_disp = f"SN: {sn[-4:]}"
-    else:
-        job_type = "バッテリー補充"
-        icon = "🔋"
-        bg = "#ffffff"
-        border = "#e0e0e0"
-        sn_disp = f"SN: {sn[-4:]} ({zone})"
-        if job_id:
-            sn_disp += f" <span style='color:#1565c0; font-size:10px;'>[{job_id}]</span>"
-
-    html = f"""<div style="background:{bg}; border:1px solid {border}; border-radius:8px; padding:10px 14px; margin-bottom:8px; display:flex; align-items:center; box-shadow: 0 1px 2px rgba(0,0,0,0.05);"><div style="font-size:24px; margin-right:12px;">{icon}</div><div style="flex-grow:1;"><div style="font-size:13px; font-weight:bold; color:#424242;">{job_type}</div><div style="font-size:11px; color:#757575;">{comp_date} | {sn_disp}</div></div><div style="text-align:right;"><div style="font-size:16px; font-weight:900; color:#212121;">¥{amount}</div></div></div>"""
-    return html
-
 # --- メイン ---
 def main():
-    st.set_page_config(page_title="Battery Manager V33", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="Battery Manager V34", page_icon="⚡", layout="wide")
     
     # ヘッダー
-    st.markdown("""<div style='display: flex; align-items: center; border-bottom: 2px solid #ff7043; padding-bottom: 10px; margin-bottom: 20px;'><div style='font-size: 40px; margin-right: 15px;'>⚡</div><div><h1 style='margin: 0; padding: 0; font-size: 32px; color: #333; font-family: sans-serif; letter-spacing: -1px;'>Battery Manager</h1><div style='font-size: 14px; color: #757575;'>Pure Instrument <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V33</span></div></div></div>""", unsafe_allow_html=True)
+    st.markdown("""<div style='display: flex; align-items: center; border-bottom: 2px solid #ff7043; padding-bottom: 10px; margin-bottom: 20px;'><div style='font-size: 40px; margin-right: 15px;'>⚡</div><div><h1 style='margin: 0; padding: 0; font-size: 32px; color: #333; font-family: sans-serif; letter-spacing: -1px;'>Battery Manager</h1><div style='font-size: 14px; color: #757575;'>Pure Instrument <span style='color: #ff7043; font-weight: bold; margin-left:8px;'>V34 (Strict & JobView)</span></div></div></div>""", unsafe_allow_html=True)
 
     st.markdown("<style>.stSlider{padding-top:1rem;}</style>", unsafe_allow_html=True)
     today = get_today_jst()
@@ -623,13 +571,15 @@ def main():
                         now_str = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
                         auto_job_id = f"J{now_str}"
                         
-                        cnt = update_status_bulk(sns, "補充済", date_done, zone, base, job_id=auto_job_id)
-                        if cnt > 0:
-                            st.success(f"{cnt}件 更新しました (ID: {auto_job_id})")
+                        # V34: エラーハンドリング追加
+                        res = update_status_bulk(sns, "補充済", date_done, zone, base, job_id=auto_job_id)
+                        if isinstance(res, dict) and res.get('error'):
+                            st.error(f"⛔️ エラー: {res['msg']}")
                         else:
-                            st.warning("更新できませんでした。在庫または出庫中のステータスか確認してください。")
-                        time.sleep(1)
-                        st.rerun()
+                            cnt = res['count'] if isinstance(res, dict) else res
+                            st.success(f"✅ {cnt}件 更新完了 (ID: {auto_job_id})")
+                            time.sleep(1)
+                            st.rerun()
 
         st.divider()
         st.markdown("##### 📌 ピックアップ (優先順)")
@@ -727,52 +677,69 @@ def main():
                     st.success(f"{reg_cnt}行 登録完了 (ID: {auto_job_id})")
                     time.sleep(1)
                     st.rerun()
+        
+        st.divider()
+        st.subheader("📊 履歴タイムライン (Job Group View)")
 
         if not df_hist.empty:
-            df_wk = df_hist[df_hist['ステータス'] == '補充済'].copy()
-            if not df_wk.empty:
-                df_wk['date'] = pd.to_datetime(df_wk['完了日'])
-                df_wk['week_start'] = df_wk['date'].apply(lambda x: x - datetime.timedelta(days=x.weekday()))
-                df_wk['is_battery'] = df_wk['備考'].apply(lambda x: 0 if 'ボーナス' in str(x) else 1)
+            df_done = df_hist[df_hist['ステータス'] == '補充済'].copy()
+            if not df_done.empty:
+                # JobIDでグルーピング（JobIDがないものは空文字として扱う）
+                # 並び順: JobIDの降順（時系列）
+                df_done['ジョブID'] = df_done['ジョブID'].fillna('')
+                # JobIDがない場合は日付で代用グルーピングするためのキー作成
+                df_done['group_key'] = df_done.apply(lambda x: x['ジョブID'] if x['ジョブID'] else f"NO-JOB-{x['完了日']}", axis=1)
                 
-                weekly_agg = df_wk.groupby('week_start').agg(
-                    total_amount=('金額', 'sum'),
-                    count=('is_battery', 'sum')
-                ).reset_index().sort_values('week_start', ascending=False)
-                weekly_agg['Label'] = weekly_agg['week_start'].dt.strftime('%Y/%m/%d') + " 週"
-
-                st.divider()
-                st.subheader("📊 履歴タイムライン")
+                # グループ化して集計
+                jobs = []
+                grouped = df_done.groupby('group_key')
                 
-                if 'orig_index' not in df_wk.columns:
-                    df_wk['orig_index'] = df_wk.index
-                recent_history = df_wk.sort_values(by=['date', 'orig_index'], ascending=[False, False]).head(30)
+                for key, group in grouped:
+                    first_row = group.iloc[0]
+                    job_id = first_row['ジョブID']
+                    date_val = first_row['完了日']
+                    area_val = first_row['エリア']
+                    total_amt = group['金額'].sum()
+                    count = len(group)
+                    
+                    # SNリスト
+                    sn_list = group['シリアルナンバー'].tolist()
+                    
+                    jobs.append({
+                        'key': key, # ソート用
+                        'job_id': job_id,
+                        'date': date_val,
+                        'area': area_val,
+                        'amount': total_amt,
+                        'count': count,
+                        'sns': sn_list
+                    })
                 
-                for _, row in recent_history.iterrows():
-                    st.markdown(create_history_card(row), unsafe_allow_html=True)
-
-                st.divider()
-                st.subheader("📈 週次比較")
+                # ソート (Keyの降順 = 新しい順)
+                jobs.sort(key=lambda x: x['key'], reverse=True)
                 
-                chart_data = weekly_agg.sort_values('week_start', ascending=True)
-                base = alt.Chart(chart_data).encode(x=alt.X('Label', sort=None, title='週'))
-                bar = base.mark_bar(color='#ffcc80').encode(
-                    y=alt.Y('total_amount', title='金額', axis=alt.Axis(titleColor='#ff7043')),
-                    tooltip=['Label', 'total_amount', 'count']
-                )
-                line = base.mark_line(color='#ff7043', strokeWidth=3).encode(
-                    y=alt.Y('count', title='本数', axis=alt.Axis(titleColor='#ff7043'))
-                )
-                points = base.mark_circle(color='#ff7043', size=60).encode(
-                    y=alt.Y('count', axis=None)
-                )
-                st.altair_chart(alt.layer(bar, line + points).resolve_scale(y='independent').properties(height=300), use_container_width=True)
-                
-                st.markdown("##### 📅 週間集計")
-                display_df = weekly_agg[['Label', 'total_amount', 'count']].rename(
-                    columns={'Label': '週 (月曜開始)', 'total_amount': '合計金額 (円)', 'count': '本数 (本)'}
-                )
-                st.dataframe(display_df, hide_index=True, use_container_width=True)
+                for j in jobs:
+                    # カード表示
+                    job_label = j['job_id'] if j['job_id'] else "Legacy Job (No ID)"
+                    
+                    # カスタムカードHTML
+                    card_html = f"""
+                    <div style="background:#ffffff; border:1px solid #e0e0e0; border-radius:8px; padding:12px; margin-bottom:5px; border-left: 5px solid #1565c0;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <div>
+                                <div style="font-size:12px; color:#757575; font-weight:bold;">{j['date']} | {j['area']}</div>
+                                <div style="font-size:16px; color:#212121; font-weight:bold;">{job_label}</div>
+                            </div>
+                            <div style="text-align:right;">
+                                <div style="font-size:20px; font-weight:900; color:#1565c0;">¥{j['amount']:,}</div>
+                                <div style="font-size:11px; color:#757575;">{j['count']}本</div>
+                            </div>
+                        </div>
+                    </div>
+                    """
+                    st.markdown(card_html, unsafe_allow_html=True)
+                    with st.expander(f"詳細を見る ({len(j['sns'])}本)"):
+                        st.write(", ".join(j['sns']))
 
     # 5. 棚卸
     with tab5:
@@ -821,10 +788,15 @@ def main():
                     st.warning("在庫差異あり")
                     with st.expander("詳細"): st.write(ghosts)
                     if st.button("一括「補充エラー」にする"):
-                        cnt = update_status_bulk(ghosts, "補充エラー", today, "", 0, "棚卸検知")
-                        st.success(f"{cnt}件 を在庫から除外しました")
-                        time.sleep(1)
-                        st.rerun()
+                        # V34: 棚卸しの一括エラー処理もエラーハンドリング対応
+                        res = update_status_bulk(ghosts, "補充エラー", today, "", 0, "棚卸検知")
+                        if isinstance(res, dict) and res.get('error'):
+                            st.error(res['msg'])
+                        else:
+                            cnt = res['count'] if isinstance(res, dict) else res
+                            st.success(f"{cnt}件 を在庫から除外しました")
+                            time.sleep(1)
+                            st.rerun()
                 else: st.success("差異なし")
 
     # 6. 分析 (Analytics)
